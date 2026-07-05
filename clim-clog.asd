@@ -32,3 +32,21 @@
   :depends-on ("clim-clog" "clog")
   :pathname "examples"
   :components ((:file "hello")))
+
+;;; Headless contract tests (Parachute), matching the valis/ubik pattern.
+;;; These exercise the medium text-metric protocol via the offline fallback
+;;; path, so they need no browser/CLOG connection and run in CI.
+(defsystem "clim-clog/tests"
+  :description "Headless contract tests for the clim-clog medium protocol."
+  :depends-on ("clim-clog" "parachute")
+  :pathname "tests"
+  :components ((:file "medium-metrics"))
+  :perform (test-op (o c)
+                    (declare (ignore o c))
+                    (let* ((pkg (or (find-package
+                                     '#:clim-clog/tests/medium-metrics)
+                                    (error "clim-clog test package not loaded.")))
+                           (result (uiop:symbol-call :parachute :test pkg)))
+                      (when (uiop:symbol-call :parachute :results-with-status
+                                              :failed result)
+                        (error "clim-clog/tests: one or more tests failed.")))))
