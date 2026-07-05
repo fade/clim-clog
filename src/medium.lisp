@@ -589,9 +589,74 @@ whole substring would block on a round-trip per keystroke."
                                      &key text-style (start 0) end)
   (multiple-value-bind (width height cursor-dx cursor-dy baseline)
       (text-size medium string :text-style text-style :start start :end end)
-    (declare (ignore cursor-dx cursor-dy))
     (let ((pad (max 1 (ceiling (* 0.2 baseline)))))
-      (values (- pad) (- baseline) (+ width pad) (- height baseline)))))
+      ;; Six values: the padded ink box (xmin ymin xmax ymax) followed by the
+      ;; cursor advance (dx dy).  mcclim's TEXT-METRICS (string) unpacks all six
+      ;; -- (multiple-value-bind (xmin ymin xmax ymax dx dy) ...) -- and feeds
+      ;; dx/dy straight into STREAM-CURSOR-MOTION, so omitting them left the
+      ;; cursor advance NIL and every wrapped text pane died with (+ NIL 0).
+      (values (- pad) (- baseline) (+ width pad) (- height baseline)
+              cursor-dx cursor-dy))))
+
+;;; ------------------------------------------------------------------
+;;; Bare-basic-medium metric fallback.
+;;;
+;;; During frame layout mcclim measures text on a sheet whose medium is not
+;;; yet the port's CLOG-MEDIUM -- an ungrafted/mediumless sheet resolves to a
+;;; plain BASIC-MEDIUM with no browser canvas behind it.  mcclim provides no
+;;; text-metric method on BASIC-MEDIUM (each backend supplies its own on its
+;;; medium class), so those calls would signal no-applicable-method and abort
+;;; the whole frame before a single pane draws.  We answer them with the same
+;;; conservative offline estimate the CLOG-MEDIUM path uses when it has no
+;;; measuring context yet -- purely font-size-relative, no round-trip.  These
+;;; are the least-specific methods; a realised CLOG-MEDIUM still uses its own
+;;; browser-measured methods above.
+;;; ------------------------------------------------------------------
+
+(defun %bm-px (text-style)
+  "Offline pixel size for TEXT-STYLE, tolerating a NIL style."
+  (if text-style (%offline-font-px text-style) 12))
+
+(defmethod text-style-ascent (text-style (medium basic-medium))
+  (* 0.8 (%bm-px text-style)))
+(defmethod text-style-descent (text-style (medium basic-medium))
+  (* 0.2 (%bm-px text-style)))
+(defmethod text-style-height (text-style (medium basic-medium))
+  (%bm-px text-style))
+(defmethod text-style-width (text-style (medium basic-medium))
+  (* 0.6 (%bm-px text-style)))
+(defmethod text-style-character-width (text-style (medium basic-medium) char)
+  (declare (ignore char))
+  (* 0.6 (%bm-px text-style)))
+
+(defmethod text-size ((medium basic-medium) string &key text-style (start 0) end)
+  (setf string (etypecase string
+                 (character (string string))
+                 (string string)))
+  (let* ((px  (%bm-px text-style))
+         (end (or end (length string)))
+         (cw  (* 0.6 px)) (asc (* 0.8 px)) (desc (* 0.2 px))
+         (lh  (+ asc desc)))
+    (if (find #\Newline string :start start :end end)
+        (loop with max-w = 0 and lines = 0 and last-w = 0
+              for ls = start then (1+ le)
+              for le = (or (position #\Newline string :start ls :end end) end)
+              do (let ((lw (* cw (- le ls))))
+                   (setf max-w (max max-w lw) last-w lw)
+                   (incf lines))
+              until (>= le end)
+              finally (return
+                        (values max-w (* lines lh) last-w (* (1- lines) lh) asc)))
+        (let ((w (* cw (- end start))))
+          (values w lh w 0 asc)))))
+
+(defmethod text-bounding-rectangle* ((medium basic-medium) string
+                                     &key text-style (start 0) end)
+  (multiple-value-bind (width height cursor-dx cursor-dy baseline)
+      (text-size medium string :text-style text-style :start start :end end)
+    (let ((pad (max 1 (ceiling (* 0.2 baseline)))))
+      (values (- pad) (- baseline) (+ width pad) (- height baseline)
+              cursor-dx cursor-dy))))
 
 ;;; ------------------------------------------------------------------
 ;;; Output flushing -- the double-buffer page-flip.
