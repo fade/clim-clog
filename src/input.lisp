@@ -52,7 +52,8 @@ The browser's Alt is mapped to CLIM's meta modifier."
 
 (defun make-clog-pointer-event (class sheet port data buttonp)
   "Construct a CLIM pointer event of CLASS for SHEET from a CLOG mouse
-event plist DATA.  When BUTTONP, include the :BUTTON slot."
+event plist DATA.  When BUTTONP, include the :BUTTON slot.  When DATA
+carries :DELTA-X / :DELTA-Y (wheel events), include them as scroll deltas."
   (let ((pointer (climi::port-pointer port))
         (x (getf data :x))
         (y (getf data :y)))
@@ -69,6 +70,10 @@ event plist DATA.  When BUTTONP, include the :BUTTON slot."
                       :timestamp (get-internal-real-time))))
       (when buttonp
         (setf args (list* :button (clog-button data) args)))
+      (when (getf data :delta-x)
+        (setf args (list* :delta-x (getf data :delta-x) args)))
+      (when (getf data :delta-y)
+        (setf args (list* :delta-y (getf data :delta-y) args)))
       (apply #'make-instance class args))))
 
 ;;; ------------------------------------------------------------------
@@ -180,6 +185,27 @@ to it (and re-focuses it on click)."
     (clog:set-on-mouse-down canvas (pointer-handler 'pointer-button-press-event   t))
     (clog:set-on-mouse-up   canvas (pointer-handler 'pointer-button-release-event t))
     (clog:set-on-mouse-move canvas (pointer-handler 'pointer-motion-event         nil))
+    ;; Wheel events: translate browser wheel deltas into CLIM
+    ;; pointer-scroll-event.  CLOG's parse-wheel-event gives :delta-x and
+    ;; :delta-y but NOT :x/:y, so we inject the pointer's last known
+    ;; position from the port pointer.  :cancel-event prevents the browser
+    ;; from scrolling the page itself.
+    (clog:set-on-wheel canvas
+      (lambda (obj data)
+        (declare (ignore obj))
+        (handler-case
+            (let* ((pointer (climi::port-pointer port))
+                   (x-y (multiple-value-list (pointer-position pointer))))
+              (clog-enqueue-event
+               port (make-clog-pointer-event
+                     'climi::pointer-scroll-event sheet port
+                     (list* :x (first x-y)
+                            :y (second x-y)
+                            data)
+                     t)))
+          (error (e)
+            (format *error-output* "~&[clim-clog input] ~a~%" e))))
+      :cancel-event t)
     ;; Make the canvas keyboard-focusable and start capturing keystrokes.
     ;; DISABLE-DEFAULT keeps Tab/Backspace/arrow keys inside the app instead
     ;; of letting the browser act on them (focus traversal, history, scroll).

@@ -308,5 +308,18 @@ the port's configured size when the sheet region is degenerate."
 ;; sheet instead of the focused pane).
 (defmethod port-force-output ((port clog-port)) nil)
 (defmethod set-sheet-pointer-cursor ((port clog-port) sheet cursor)
-  (declare (ignore sheet cursor))
-  nil)
+  (let ((canvas (clog-port-canvas port)))
+    (when canvas
+      (setf (clog:style canvas "cursor")
+            (ecase cursor
+              (:default "default")
+              (:col-resize "col-resize")
+              (:row-resize "row-resize")
+              (:pointer "pointer")
+              (:text "text")
+              (:wait "wait")
+              (:crosshair "crosshair")
+              (:move "move")
+              (:help "help")
+              ((:vertical-scroll :scroll) "ns-resize")
+              ((:horizontal-scroll :scroll-h) "ew-resize"))))))
