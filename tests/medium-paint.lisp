@@ -1,7 +1,7 @@
 ;;;; tests/medium-paint.lisp
 ;;;;
 ;;;; Headless contract tests for how the clim-clog medium paints: the CSS
-;;;; colours its default inks resolve to.
+;;;; colours its default inks resolve to and the fill its cleared areas take.
 ;;;;
 ;;;; These need no browser.  They run on a bare CLIM:BASIC-MEDIUM (the
 ;;;; CLOG-MEDIUM superclass), constructed with explicit foreground and
@@ -62,3 +62,18 @@
     (is equal "rgba(0,0,0,0)" (clim-clog::ink->css +transparent-ink+))
     (is equal "rgba(0,0,0,0)" (clim-clog::ink->css +flipping-ink+ m))
     (is equal "rgba(0,0,0,0)" (clim-clog::ink->css +transparent-ink+ m))))
+
+;;; ------------------------------------------------------------------
+;;; A cleared area takes the medium's background.
+;;; ------------------------------------------------------------------
+
+(define-test cleared-area-takes-the-medium-background
+  ;; 0.7 * 255 is 178.5, which ROUND takes to the even 178.
+  (is equal "rgb(230,204,178)"
+      (clim-clog::clear-area-style
+       (%medium :background (make-rgb-color 0.9 0.8 0.7)))))
+
+(define-test cleared-area-is-never-transparent
+  (let ((css (clim-clog::clear-area-style (%medium))))
+    (is equal "rgb(255,255,255)" css)
+    (false (equal "rgba(0,0,0,0)" css))))
