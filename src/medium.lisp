@@ -25,7 +25,7 @@
 ;;;; filled text               CLOG:FILL-TEXT
 ;;;; outlined text             CLOG:STROKE-TEXT
 ;;;; text metrics              CLOG:MEASURE-TEXT
-;;;; clear a region            CLOG:CLEAR-RECT
+;;;; clear a region            CLOG:FILL-RECT (background)
 ;;;;
 ;;;; STATUS (Phase 3): interactive.  Inks are handled for solid colours;
 ;;;; transformations are applied to coordinates; drawing is double-buffered
@@ -71,25 +71,31 @@
 ;;; Helpers: CLIM -> CSS
 ;;; ------------------------------------------------------------------
 
-(defun ink->css (ink)
-  "Translate a CLIM INK to a CSS colour string.
+(defun ink->css (ink &optional medium)
+  "Return a CSS colour string for the CLIM INK.
 
-Solid colours and the standard indirect inks are handled.  +FLIPPING-INK+
-and +TRANSPARENT-INK+ render as fully transparent: the command loop uses
-+FLIPPING-INK+ for XOR presentation highlighting, which a 2D canvas cannot
-do directly, so we no-op it (true highlight via canvas compositing is a
-Roadmap item; hover feedback comes from the pointer-documentation pane).
-Patterns and gradients are also Roadmap items and fall back to black."
+A solid colour renders as rgb().  Without MEDIUM, +FOREGROUND-INK+ and
++BACKGROUND-INK+ render black and white.  With MEDIUM they resolve one
+level through MEDIUM-FOREGROUND and MEDIUM-BACKGROUND, so an indirect ink
+stored as a medium colour renders as it would without MEDIUM.
++FLIPPING-INK+ and +TRANSPARENT-INK+ render fully transparent: a 2D canvas
+has no XOR mode.  Any other ink renders black."
   (cond
     ((typep ink 'clim:color)
      (multiple-value-bind (r g b) (clim:color-rgb ink)
        (format nil "rgb(~d,~d,~d)"
                (round (* 255 r)) (round (* 255 g)) (round (* 255 b)))))
-    ((eq ink clim:+foreground-ink+) "black")
-    ((eq ink clim:+background-ink+) "white")
+    ((eq ink clim:+foreground-ink+)
+     (if medium (ink->css (medium-foreground medium) nil) "black"))
+    ((eq ink clim:+background-ink+)
+     (if medium (ink->css (medium-background medium) nil) "white"))
     ((or (eq ink clim:+transparent-ink+) (eq ink clim:+flipping-ink+))
      "rgba(0,0,0,0)")
     (t "black")))
+
+(defun clear-area-style (medium)
+  "Return the CSS fill a cleared area takes: MEDIUM's background through INK->CSS."
+  (ink->css (medium-background medium) medium))
 
 (defun text-style->css (text-style)
   "Translate a CLIM TEXT-STYLE to a CSS `font' shorthand string, e.g.
@@ -171,14 +177,14 @@ T (a default on/off pattern), or a sequence of segment lengths."
 (defun apply-stroke-state (ctx medium)
   "Push MEDIUM's ink, line thickness and dash pattern onto the context."
   (let ((line-style (medium-line-style medium)))
-    (setf (clog:stroke-style ctx) (ink->css (medium-ink medium)))
+    (setf (clog:stroke-style ctx) (ink->css (medium-ink medium) medium))
     (setf (clog:line-width ctx)
           (max 1 (round (line-style-thickness line-style))))
     (clog:set-line-dash ctx (%dash-array-js line-style))))
 
 (defun apply-fill-state (ctx medium)
   "Push MEDIUM's ink onto the context as fill state."
-  (setf (clog:fill-style ctx) (ink->css (medium-ink medium))))
+  (setf (clog:fill-style ctx) (ink->css (medium-ink medium) medium)))
 
 ;;; ------------------------------------------------------------------
 ;;; Clipping
@@ -374,7 +380,8 @@ label correctly instead of drawing it at the baseline and clipping the top."
   (with-clipped-context (ctx medium)
     (with-device-position (dl dt medium left top)
       (with-device-position (dr db medium right bottom)
-        (clog:clear-rect ctx dl dt (- dr dl) (- db dt))))))
+        (setf (clog:fill-style ctx) (clear-area-style medium))
+        (clog:fill-rect ctx dl dt (- dr dl) (- db dt))))))
 
 ;;; ------------------------------------------------------------------
 ;;; Pixmaps and MEDIUM-COPY-AREA (Phase 3)
