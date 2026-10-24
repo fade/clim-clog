@@ -34,20 +34,23 @@
   :components ((:file "hello")))
 
 ;;; Headless contract tests (Parachute), matching the valis/ubik pattern.
-;;; These exercise the medium's default inks and its text metrics (the
-;;; latter via the offline fallback path), so they need no browser/CLOG
-;;; connection and run in CI.  The test-op runs every listed suite package
-;;; in a single Parachute run.
+;;; These exercise the medium's default inks, its text metrics (the latter
+;;; via the offline fallback path), and the factoring of a browser wheel
+;;; event into scroll-event initargs.  They need no browser/CLOG connection
+;;; and run in CI.  The test-op runs every listed suite package in a single
+;;; Parachute run.
 (defsystem "clim-clog/tests"
   :description "Headless contract tests for the clim-clog medium protocol."
   :depends-on ("clim-clog" "parachute")
   :pathname "tests"
   :components ((:file "medium-metrics")
-               (:file "medium-paint"))
+               (:file "medium-paint")
+               (:file "wheel-input"))
   :perform (test-op (o c)
                     (declare (ignore o c))
                     (let* ((suites '("CLIM-CLOG/TESTS/MEDIUM-METRICS"
-                                     "CLIM-CLOG/TESTS/MEDIUM-PAINT"))
+                                     "CLIM-CLOG/TESTS/MEDIUM-PAINT"
+                                     "CLIM-CLOG/TESTS/WHEEL-INPUT"))
                            (packages
                              (mapcar
                               (lambda (name)
