@@ -93,6 +93,10 @@ has no XOR mode.  Any other ink renders black."
      "rgba(0,0,0,0)")
     (t "black")))
 
+(defun clear-area-style (medium)
+  "Return the CSS fill a cleared area takes: MEDIUM's background through INK->CSS."
+  (ink->css (medium-background medium) medium))
+
 (defun text-style->css (text-style)
   "Translate a CLIM TEXT-STYLE to a CSS `font' shorthand string, e.g.
 \"italic bold 14px sans-serif\"."
@@ -376,7 +380,8 @@ label correctly instead of drawing it at the baseline and clipping the top."
   (with-clipped-context (ctx medium)
     (with-device-position (dl dt medium left top)
       (with-device-position (dr db medium right bottom)
-        (clog:clear-rect ctx dl dt (- dr dl) (- db dt))))))
+        (setf (clog:fill-style ctx) (clear-area-style medium))
+        (clog:fill-rect ctx dl dt (- dr dl) (- db dt))))))
 
 ;;; ------------------------------------------------------------------
 ;;; Pixmaps and MEDIUM-COPY-AREA (Phase 3)
