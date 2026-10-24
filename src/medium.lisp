@@ -25,7 +25,7 @@
 ;;;; filled text               CLOG:FILL-TEXT
 ;;;; outlined text             CLOG:STROKE-TEXT
 ;;;; text metrics              CLOG:MEASURE-TEXT
-;;;; clear a region            CLOG:CLEAR-RECT
+;;;; clear a region            CLOG:FILL-RECT (background)
 ;;;;
 ;;;; STATUS (Phase 3): interactive.  Inks are handled for solid colours;
 ;;;; transformations are applied to coordinates; drawing is double-buffered
