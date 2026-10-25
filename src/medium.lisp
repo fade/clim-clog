@@ -499,7 +499,7 @@ independent of the sample text); EM-WIDTH is the measured advance of \"m\"."
                 (values (* 0.8 px) (* 0.2 px) (* 0.6 px)))
               (progn
                 (setf (clog:font-style ctx) css)
-                (let* ((tm (clog:measure-text ctx "m"))
+                (let* ((tm (%measure-text ctx "m"))
                        (asc (clog:font-bounding-box-ascent tm))
                        (desc (clog:font-bounding-box-descent tm))
                        (emw (clog:width tm)))
@@ -517,8 +517,19 @@ independent of the sample text); EM-WIDTH is the measured advance of \"m\"."
               (* 0.6 (%offline-font-px text-style))
               (progn
                 (setf (clog:font-style ctx) css)
-                (let ((w (clog:width (clog:measure-text ctx (string char)))))
+                (let ((w (clog:width (%measure-text ctx (string char)))))
                   (setf (gethash key cache) w))))))))
+
+(defun %measure-text (ctx string)
+  "Return the CLOG:CLOG-TEXT-METRICS CLOG measures for STRING in CTX's current
+font, STRING escaped for the single-quoted JavaScript literal CLOG splices it
+into."
+  ;; CLOG:MEASURE-TEXT splices its text into a single-quoted JavaScript
+  ;; literal unescaped, whereas CLOG:FILL-TEXT escapes it, so a quote,
+  ;; backslash, or newline breaks the script and the width reads back 0.
+  ;; Drop this escape when CLOG's MEASURE-TEXT escapes its text, or the
+  ;; text is escaped twice.
+  (clog:measure-text ctx (clog:escape-string string)))
 
 (defmethod text-style-ascent (text-style (medium clog-medium))
   (values (%font-metrics medium text-style)))
