@@ -16,7 +16,13 @@
            #:recorded-scripts
            #:recorded-text-metrics
            #:recorded-script
-           #:js-string-argument))
+           #:js-string-argument
+           #:replay-canvas
+           #:paint-kind
+           #:paint-width
+           #:paint-subpaths
+           #:subpath-elements
+           #:subpath-closed-p))
 
 (in-package #:clim-clog/tests/recording-context)
 
@@ -148,3 +154,250 @@ the browser has thrown."
   (if (js-string-argument (recorded-script obj) "measureText")
       "7.5"
       default-answer))
+
+;;; ------------------------------------------------------------------
+;;; Replaying recorded canvas calls as geometry.
+
+(defstruct paint
+  "One stroke() or fill() of a replay, with the slots:
+  - KIND, :STROKE or :FILL;
+  - WIDTH, the effective stroke width in device pixels, NIL for a fill;
+  - SUBPATHS, the path painted."
+  kind
+  width
+  subpaths)
+
+(defstruct subpath
+  "One subpath of a replayed path.  ELEMENTS are in drawing order, each
+(:MOVE point), (:LINE point), or (:ARC points), every point an (X . Y) cons in
+device coordinates.  An arc lists 33 samples from its start to its end; the
+line a canvas adds from the current point to an arc's start is implied, not
+listed.  CLOSED-P is true once closePath() closes the subpath."
+  (elements '())
+  (closed-p nil))
+
+(defparameter *skipped-canvas-calls*
+  '("strokeStyle" "fillStyle" "font" "textAlign" "textBaseline" "globalAlpha"
+    "setLineDash" "rect" "clip" "fillRect" "strokeRect" "fillText" "strokeText")
+  "Canvas properties and calls REPLAY-CANVAS skips: state and drawing these
+suites do not read.")
+
+(defun %js-number-text-p (text)
+  "True when TEXT is a decimal JavaScript number literal: an optional sign,
+digits with at most one decimal point, and an optional exponent."
+  (let ((i 0)
+        (n (length text))
+        (digits 0))
+    (flet ((next-is (test)
+             (and (< i n) (funcall test (char text i))))
+           (sign-p (c)
+             (member c '(#\+ #\-))))
+      (when (next-is #'sign-p)
+        (incf i))
+      (loop while (next-is #'digit-char-p)
+            do (incf i) (incf digits))
+      (when (next-is (lambda (c) (char= c #\.)))
+        (incf i)
+        (loop while (next-is #'digit-char-p)
+              do (incf i) (incf digits)))
+      (when (and (plusp digits) (next-is (lambda (c) (char-equal c #\e))))
+        (incf i)
+        (when (next-is #'sign-p)
+          (incf i))
+        (unless (next-is #'digit-char-p)
+          (return-from %js-number-text-p nil))
+        (loop while (next-is #'digit-char-p)
+              do (incf i)))
+      (and (plusp digits) (= i n)))))
+
+(defun %js-argument (text)
+  "The value of the JavaScript argument TEXT: a double-float for a number
+literal, :TRUE for true, and :FALSE for false.  Signals an error for anything
+else."
+  (cond ((string= text "true") :true)
+        ((string= text "false") :false)
+        ((%js-number-text-p text)
+         (let ((*read-default-float-format* 'double-float)
+               (*read-eval* nil))
+           (float (read-from-string text) 1d0)))
+        (t (error "replay-canvas: ~s is not a JavaScript number, true, or false."
+                  text))))
+
+(defun %split-arguments (text)
+  "The comma-separated argument texts of TEXT; NIL when TEXT is empty."
+  (unless (string= text "")
+    (loop for start = 0 then (1+ comma)
+          for comma = (position #\, text :start start)
+          collect (subseq text start comma)
+          while comma)))
+
+(defun %canvas-call (script)
+  "Split SCRIPT, as CLOG sends it to a context, into the name after its
+clog['...']. prefix, :SET or :CALL, and the assigned value text or the
+argument text.  Signals an error when SCRIPT lacks the prefix or is neither an
+assignment nor a call."
+  (let* ((prefix-end (and (eql 0 (search "clog['" script))
+                          (search "']." script)))
+         (body (if prefix-end
+                   (subseq script (+ prefix-end 3))
+                   (error "replay-canvas: ~s has no clog['...']. prefix." script)))
+         (name-end (or (position-if-not (lambda (c) (or (alphanumericp c) (char= c #\_)))
+                                        body)
+                       (length body)))
+         (name (subseq body 0 name-end))
+         (next (and (< name-end (length body)) (char body name-end))))
+    (cond ((eql next #\=)
+           (values name :set (subseq body (1+ name-end))))
+          ((and (eql next #\() (char= (char body (1- (length body))) #\)))
+           (values name :call (subseq body (1+ name-end) (1- (length body)))))
+          (t (error "replay-canvas: cannot read the canvas call ~s." script)))))
+
+(defun %compose (m n)
+  "The canvas matrix M times N, each a list (A B C D E F): the map that
+applies N, then M."
+  (destructuring-bind (a b c d e f) m
+    (destructuring-bind (a2 b2 c2 d2 e2 f2) n
+      (list (+ (* a a2) (* c b2)) (+ (* b a2) (* d b2))
+            (+ (* a c2) (* c d2)) (+ (* b c2) (* d d2))
+            (+ (* a e2) (* c f2) e) (+ (* b e2) (* d f2) f)))))
+
+(defun %map-point (m x y)
+  "The point (X, Y) mapped through the canvas matrix M, as an (X . Y) cons."
+  (destructuring-bind (a b c d e f) m
+    (cons (+ (* a x) (* c y) e) (+ (* b x) (* d y) f))))
+
+(defun %arc-points (matrix cx cy rx ry rotation start end anticlockwise)
+  "Sample 33 points along an elliptical arc as a canvas draws it, mapped
+through MATRIX.  The arc sweeps from START to END in increasing angle
+(clockwise on the canvas), or in decreasing angle when ANTICLOCKWISE is true.
+A sweep of 2 pi or more in the drawing direction is the whole ellipse; any
+other difference is reduced modulo 2 pi in that direction."
+  (let* ((two-pi (* 2 pi))
+         (sweep (if anticlockwise
+                    (if (>= (- start end) two-pi)
+                        (- two-pi)
+                        (- (mod (- start end) two-pi)))
+                    (if (>= (- end start) two-pi)
+                        two-pi
+                        (mod (- end start) two-pi)))))
+    (loop for i from 0 to 32
+          collect (let* ((angle (+ start (* sweep (/ i 32))))
+                         (x (* rx (cos angle)))
+                         (y (* ry (sin angle))))
+                    (%map-point matrix
+                                (+ cx (- (* x (cos rotation)) (* y (sin rotation))))
+                                (+ cy (* x (sin rotation)) (* y (cos rotation))))))))
+
+(defun %check-arguments (name args numbers &optional flag)
+  "Return ARGS of the canvas call NAME when they are NUMBERS numbers followed,
+when FLAG is true, by an optional :TRUE or :FALSE.  Signals an error naming
+the call otherwise."
+  (let ((count (length args)))
+    (unless (and (or (= count numbers) (and flag (= count (1+ numbers))))
+                 (every #'realp (subseq args 0 (min count numbers)))
+                 (or (= count numbers) (member (car (last args)) '(:true :false))))
+      (error "replay-canvas: ~a takes ~d number~:p~:[~;, then optionally true or false~], not ~s."
+             name numbers flag args))
+    args))
+
+(defun replay-canvas (scripts)
+  "Read SCRIPTS in order as a canvas would, after each one's clog['...']. prefix,
+and return the paints, one per stroke() or fill() in order.  Give a stroke the
+width lineWidth times the square root of the absolute determinant of the
+transform current at the stroke.  Map each point to device coordinates through
+the transform current when it was added.  Interpret these calls:
+  - save() and restore(), a stack of transform and lineWidth;
+  - transform(), the current matrix times the given one, and resetTransform();
+  - lineWidth=;
+  - beginPath(), moveTo(), lineTo(), and closePath();
+  - arc(x,y,r,start,end[,anticlockwise]);
+  - ellipse(x,y,rx,ry,rotation,start,end[,anticlockwise]);
+  - stroke() and fill().
+Start a new subpath for lineTo() or arc() when none is open, as after
+closePath().  Skip the calls in *SKIPPED-CANVAS-CALLS*.  Signal an error
+naming any other call, and for any argument that is not a JavaScript number,
+true, or false."
+  (let ((identity (list 1d0 0d0 0d0 1d0 0d0 0d0)))
+    (let ((matrix identity)
+          (line-width 1d0)
+          (stack '())
+          (subpaths '())
+          (current nil)
+          (paints '()))
+      (flet ((add (element)
+               (if current
+                   (setf (subpath-elements current)
+                         (append (subpath-elements current) (list element)))
+                   (push (setf current (make-subpath :elements (list element)))
+                         subpaths)))
+             (painted ()
+               (mapcar (lambda (s)
+                         (make-subpath :elements (copy-list (subpath-elements s))
+                                       :closed-p (subpath-closed-p s)))
+                       (reverse subpaths))))
+        (dolist (script scripts (nreverse paints))
+          (multiple-value-bind (name kind text) (%canvas-call script)
+            (cond
+              ((member name *skipped-canvas-calls* :test #'string=))
+              ((eq kind :set)
+               (let ((value (and (string= name "lineWidth") (%js-argument text))))
+                 (unless (realp value)
+                   (error "replay-canvas: cannot replay ~s." script))
+                 (setf line-width value)))
+              (t
+               (let ((args (mapcar #'%js-argument (%split-arguments text))))
+                 (flet ((check (numbers &optional flag)
+                          (%check-arguments name args numbers flag)))
+                   (cond
+                     ((string= name "save")
+                      (check 0)
+                      (push (list matrix line-width) stack))
+                     ((string= name "restore")
+                      (check 0)
+                      (when stack
+                        (destructuring-bind (m w) (pop stack)
+                          (setf matrix m
+                                line-width w))))
+                     ((string= name "transform")
+                      (setf matrix (%compose matrix (check 6))))
+                     ((string= name "resetTransform")
+                      (check 0)
+                      (setf matrix identity))
+                     ((string= name "beginPath")
+                      (check 0)
+                      (setf subpaths '()
+                            current nil))
+                     ((string= name "moveTo")
+                      (destructuring-bind (x y) (check 2)
+                        (setf current nil)
+                        (add (list :move (%map-point matrix x y)))))
+                     ((string= name "lineTo")
+                      (destructuring-bind (x y) (check 2)
+                        (add (list (if current :line :move) (%map-point matrix x y)))))
+                     ((string= name "closePath")
+                      (check 0)
+                      (when current
+                        (setf (subpath-closed-p current) t
+                              current nil)))
+                     ((string= name "arc")
+                      (destructuring-bind (x y r start end &optional flag) (check 5 t)
+                        (add (list :arc (%arc-points matrix x y r r 0 start end
+                                                     (eq flag :true))))))
+                     ((string= name "ellipse")
+                      (destructuring-bind (x y rx ry rotation start end &optional flag)
+                          (check 7 t)
+                        (add (list :arc (%arc-points matrix x y rx ry rotation start end
+                                                     (eq flag :true))))))
+                     ((string= name "stroke")
+                      (check 0)
+                      (destructuring-bind (a b c d e f) matrix
+                        (declare (ignore e f))
+                        (push (make-paint :kind :stroke
+                                          :width (* line-width (sqrt (abs (- (* a d) (* b c)))))
+                                          :subpaths (painted))
+                              paints)))
+                     ((string= name "fill")
+                      (check 0)
+                      (push (make-paint :kind :fill :subpaths (painted)) paints))
+                     (t (error "replay-canvas: unknown canvas call ~a in ~s."
+                               name script)))))))))))))

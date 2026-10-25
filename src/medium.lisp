@@ -306,32 +306,63 @@ responsible for begin-path and the fill/stroke step."
                                    (elt position-seq (+ i 2)) (elt position-seq (+ i 3))
                                    filled)))
 
+(defun %ellipse-parameter (r1x r1y r2x r2y det angle)
+  "Return the unit-circle parameter of the point where the ray at CLIM ANGLE
+meets the ellipse whose radius matrix has the columns (R1X, R1Y) and (R2X, R2Y)
+and the non-zero determinant DET.  The ray points along (cos ANGLE, -sin ANGLE)
+on the y-down canvas."
+  (let ((dx (cos angle))
+        (dy (- (sin angle))))
+    (atan (/ (- (* r1x dy) (* r1y dx)) det)
+          (/ (- (* r2y dx) (* r2x dy)) det))))
+
 (defmethod medium-draw-ellipse* ((medium clog-medium) center-x center-y
                                  radius-1-dx radius-1-dy radius-2-dx radius-2-dy
                                  start-angle end-angle filled)
-  ;; CLIM specifies an ellipse by a centre and two radius vectors R1, R2 that
-  ;; need not be orthogonal (a general/skewed ellipse).  Rather than reduce
-  ;; them to canvas ellipse()'s radius-x / radius-y / rotation -- which is only
-  ;; exact when R1 _|_ R2 -- we install the affine map that sends the unit
-  ;; circle to the ellipse and draw a unit arc through it.  A point (cos a,
-  ;; sin a) on the unit circle maps to centre + cos a * R1 + sin a * R2, i.e.
-  ;; the canvas matrix [a b c d e f] = [R1x R1y R2x R2y Cx Cy].  This is exact
-  ;; for any (including skewed) radii.  The clip path was already rasterised in
-  ;; device space before this transform, so it still applies correctly.
-  (with-clipped-context (ctx medium)
-    (with-device-position (cx cy medium center-x center-y)
-      (clog:canvas-save ctx)
-      (unwind-protect
-           (progn
-             (clog:transform ctx
-                             (%js radius-1-dx) (%js radius-1-dy)
-                             (%js radius-2-dx) (%js radius-2-dy)
-                             cx cy)
-             (clog:begin-path ctx)
-             (clog:arc ctx 0 0 1 (%js start-angle) (%js end-angle))
-             (cond (filled (apply-fill-state ctx medium)  (clog:path-fill ctx))
-                   (t      (apply-stroke-state ctx medium) (clog:path-stroke ctx))))
-        (clog:canvas-restore ctx)))))
+  ;; CLIM gives an ellipse as a centre and two radius vectors R1, R2 that need
+  ;; not be orthogonal.  The path is built through the affine map that sends
+  ;; the unit circle to the ellipse, the canvas matrix [R1x R1y R2x R2y Cx Cy],
+  ;; which is exact for skewed radii.  The map is restored before the paint:
+  ;; the path keeps its shape and lineWidth stays in device pixels.
+  ;;
+  ;; CLIM angles are rays measured counter-clockwise from the positive x axis
+  ;; on the y-down canvas; a ray at angle A points along (cos A, -sin A).
+  ;; %ELLIPSE-PARAMETER maps each angle to the unit circle.  The arc sweeps
+  ;; counter-clockwise on screen, which on the unit circle is counter-clockwise
+  ;; when the matrix's determinant is positive and clockwise when it is
+  ;; negative; the canvas's anticlockwise argument selects the sense.  CLOG
+  ;; prints that argument with ~A, so it is passed as the string "true".
+  ;;
+  ;; A sweep of 2 pi or more is the whole ellipse, with no centre point.  A
+  ;; filled arc of less is a pie from the centre.  With a zero determinant (a
+  ;; flat ellipse), nothing is drawn.
+  (let ((det (- (* radius-1-dx radius-2-dy) (* radius-2-dx radius-1-dy))))
+    (unless (climi::coordinate= det 0)
+      (with-clipped-context (ctx medium)
+        (with-device-position (cx cy medium center-x center-y)
+          (clog:canvas-save ctx)
+          (unwind-protect
+               (progn
+                 (clog:transform ctx
+                                 (%js radius-1-dx) (%js radius-1-dy)
+                                 (%js radius-2-dx) (%js radius-2-dy)
+                                 cx cy)
+                 (clog:begin-path ctx)
+                 (if (climi::coordinate<= (* 2 pi) (- end-angle start-angle))
+                     (clog:arc ctx 0 0 1 0 (%js (* 2 pi)))
+                     (flet ((parameter (angle)
+                              (%js (%ellipse-parameter radius-1-dx radius-1-dy
+                                                       radius-2-dx radius-2-dy
+                                                       det angle))))
+                       (when filled
+                         (clog:move-to ctx 0 0))
+                       (clog:arc ctx 0 0 1 (parameter start-angle) (parameter end-angle)
+                                 :anticlockwise (and (plusp det) "true"))
+                       (when filled
+                         (clog:close-path ctx)))))
+            (clog:canvas-restore ctx))
+          (cond (filled (apply-fill-state ctx medium)  (clog:path-fill ctx))
+                (t      (apply-stroke-state ctx medium) (clog:path-stroke ctx))))))))
 
 (defun %text-align->css (align-x)
   "Map a CLIM ALIGN-X keyword to a canvas textAlign value."
