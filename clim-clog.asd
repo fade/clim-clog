@@ -39,7 +39,9 @@
 ;;;   - its text metrics, via the offline fallback path;
 ;;;   - the factoring of a browser wheel event into scroll-event initargs;
 ;;;   - the text handed to CLOG to measure, recorded by a stand-in canvas
-;;;     context.
+;;;     context;
+;;;   - the canvas calls that drawing an elliptical arc makes, read back from
+;;;     that context by a replay of its recorded scripts.
 ;;; The test-op runs every listed suite package in a single Parachute run.
 (defsystem "clim-clog/tests"
   :description "Headless contract tests for the clim-clog medium protocol."
@@ -49,13 +51,15 @@
                (:file "medium-paint")
                (:file "wheel-input")
                (:file "recording-context")
-               (:file "measured-text" :depends-on ("recording-context")))
+               (:file "measured-text" :depends-on ("recording-context"))
+               (:file "ellipse-arcs" :depends-on ("recording-context")))
   :perform (test-op (o c)
                     (declare (ignore o c))
                     (let* ((suites '("CLIM-CLOG/TESTS/MEDIUM-METRICS"
                                      "CLIM-CLOG/TESTS/MEDIUM-PAINT"
                                      "CLIM-CLOG/TESTS/WHEEL-INPUT"
-                                     "CLIM-CLOG/TESTS/MEASURED-TEXT"))
+                                     "CLIM-CLOG/TESTS/MEASURED-TEXT"
+                                     "CLIM-CLOG/TESTS/ELLIPSE-ARCS"))
                            (packages
                              (mapcar
                               (lambda (name)
