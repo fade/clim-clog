@@ -76,6 +76,35 @@ carries :DELTA-X / :DELTA-Y (wheel events), include them as scroll deltas."
         (setf args (list* :delta-y (getf data :delta-y) args)))
       (apply #'make-instance class args))))
 
+(defparameter *wheel-line-pixels* 16
+  "Pixels one line of a line-mode wheel event scrolls.")
+
+(defun wheel-scroll-initargs (data &key page-height)
+  "Return the POINTER-SCROLL-EVENT initargs for the CLOG wheel plist DATA.
+
+The result is a plist of :DELTA-X, :DELTA-Y, and :BUTTON, or NIL when both
+deltas are zero.  Deltas are reals in pixels and keep their sign:
+  mode 0 (pixels) passes them through;
+  mode 1 (lines) multiplies them by *WHEEL-LINE-PIXELS*;
+  mode 2 (pages) multiplies them by PAGE-HEIGHT, or by *WHEEL-LINE-PIXELS*
+  when PAGE-HEIGHT is NIL.
+An unknown mode passes the deltas through.  :BUTTON follows the sign of
+DELTA-Y when it is nonzero (+POINTER-WHEEL-DOWN+ or +POINTER-WHEEL-UP+),
+else the sign of DELTA-X (+POINTER-WHEEL-RIGHT+ or +POINTER-WHEEL-LEFT+)."
+  (let* ((scale (case (getf data :delta-mode)
+                  (1 *wheel-line-pixels*)
+                  (2 (or page-height *wheel-line-pixels*))
+                  (t 1)))
+         (dx (* scale (or (getf data :delta-x) 0)))
+         (dy (* scale (or (getf data :delta-y) 0))))
+    (unless (and (zerop dx) (zerop dy))
+      (list :delta-x dx
+            :delta-y dy
+            :button (cond ((plusp dy) +pointer-wheel-down+)
+                          ((minusp dy) +pointer-wheel-up+)
+                          ((plusp dx) +pointer-wheel-right+)
+                          (t +pointer-wheel-left+))))))
+
 ;;; ------------------------------------------------------------------
 ;;; Keyboard: browser KeyboardEvent.key -> CLIM keysym name + character
 ;;; ------------------------------------------------------------------
@@ -161,8 +190,8 @@ the rest McCLIM derives the character (if any) from the keysym name."
 ;;; ------------------------------------------------------------------
 
 (defun install-clog-input-handlers (port sheet canvas)
-  "Attach CLOG pointer and keyboard handlers on CANVAS that enqueue CLIM
-events for SHEET (the top-level mirrored sheet) onto PORT's queue.
+  "Attach CLOG pointer, wheel, and keyboard handlers on CANVAS that enqueue
+CLIM events for SHEET (the top-level mirrored sheet) onto PORT's queue.
 
 A <canvas> is not focusable by default, so it receives no keyboard events.
 We give it tab-index 0 and focus it; the browser then routes keydown/keyup
@@ -175,6 +204,30 @@ to it (and re-focuses it on click)."
                   port (make-clog-pointer-event class sheet port data buttonp))
                (error (e)
                  (format *error-output* "~&[clim-clog input] ~a~%" e)))))
+         (wheel-handler ()
+           (lambda (obj data)
+             (declare (ignore obj))
+             (handler-case
+                 (let ((initargs
+                         (wheel-scroll-initargs
+                          data
+                          :page-height (bounding-rectangle-height
+                                        (sheet-region sheet)))))
+                   (when initargs
+                     (let ((pointer (climi::port-pointer port)))
+                       (multiple-value-bind (x y) (pointer-position pointer)
+                         (clog-enqueue-event
+                          port
+                          (apply #'make-instance 'pointer-scroll-event
+                                 :sheet sheet
+                                 :pointer pointer
+                                 :x x
+                                 :y y
+                                 :modifier-state 0
+                                 :timestamp (get-internal-real-time)
+                                 initargs))))))
+               (error (e)
+                 (format *error-output* "~&[clim-clog input] ~a~%" e)))))
          (key-handler (class)
            (lambda (obj data)
              (declare (ignore obj))
@@ -185,27 +238,9 @@ to it (and re-focuses it on click)."
     (clog:set-on-mouse-down canvas (pointer-handler 'pointer-button-press-event   t))
     (clog:set-on-mouse-up   canvas (pointer-handler 'pointer-button-release-event t))
     (clog:set-on-mouse-move canvas (pointer-handler 'pointer-motion-event         nil))
-    ;; Wheel events: translate browser wheel deltas into CLIM
-    ;; pointer-scroll-event.  CLOG's parse-wheel-event gives :delta-x and
-    ;; :delta-y but NOT :x/:y, so we inject the pointer's last known
-    ;; position from the port pointer.  :cancel-event prevents the browser
-    ;; from scrolling the page itself.
-    (clog:set-on-wheel canvas
-      (lambda (obj data)
-        (declare (ignore obj))
-        (handler-case
-            (let* ((pointer (climi::port-pointer port))
-                   (x-y (multiple-value-list (pointer-position pointer))))
-              (clog-enqueue-event
-               port (make-clog-pointer-event
-                     'climi::pointer-scroll-event sheet port
-                     (list* :x (first x-y)
-                            :y (second x-y)
-                            data)
-                     t)))
-          (error (e)
-            (format *error-output* "~&[clim-clog input] ~a~%" e))))
-      :cancel-event t)
+    ;; With CANCEL-EVENT the browser handler returns false, so the page
+    ;; does not scroll as well.
+    (clog:set-on-wheel canvas (wheel-handler) :cancel-event t)
     ;; Make the canvas keyboard-focusable and start capturing keystrokes.
     ;; DISABLE-DEFAULT keeps Tab/Backspace/arrow keys inside the app instead
     ;; of letting the browser act on them (focus traversal, history, scroll).

@@ -34,19 +34,44 @@
   :components ((:file "hello")))
 
 ;;; Headless contract tests (Parachute), matching the valis/ubik pattern.
-;;; These exercise the medium text-metric protocol via the offline fallback
-;;; path, so they need no browser/CLOG connection and run in CI.
+;;; They need no browser or CLOG connection and run in CI.  They cover:
+;;;   - the medium's default inks;
+;;;   - its text metrics, via the offline fallback path;
+;;;   - the factoring of a browser wheel event into scroll-event initargs;
+;;;   - the text handed to CLOG to measure, recorded by a stand-in canvas
+;;;     context;
+;;;   - the canvas calls that drawing an elliptical arc makes, read back from
+;;;     that context by a replay of its recorded scripts.
+;;; The test-op runs every listed suite package in a single Parachute run.
 (defsystem "clim-clog/tests"
   :description "Headless contract tests for the clim-clog medium protocol."
   :depends-on ("clim-clog" "parachute")
   :pathname "tests"
-  :components ((:file "medium-metrics"))
+  :components ((:file "medium-metrics")
+               (:file "medium-paint")
+               (:file "wheel-input")
+               (:file "recording-context")
+               (:file "measured-text" :depends-on ("recording-context"))
+               (:file "ellipse-arcs" :depends-on ("recording-context")))
   :perform (test-op (o c)
                     (declare (ignore o c))
-                    (let* ((pkg (or (find-package
-                                     '#:clim-clog/tests/medium-metrics)
-                                    (error "clim-clog test package not loaded.")))
-                           (result (uiop:symbol-call :parachute :test pkg)))
+                    (let* ((suites '("CLIM-CLOG/TESTS/MEDIUM-METRICS"
+                                     "CLIM-CLOG/TESTS/MEDIUM-PAINT"
+                                     "CLIM-CLOG/TESTS/WHEEL-INPUT"
+                                     "CLIM-CLOG/TESTS/MEASURED-TEXT"
+                                     "CLIM-CLOG/TESTS/ELLIPSE-ARCS"))
+                           (packages
+                             (mapcar
+                              (lambda (name)
+                                (let ((pkg (or (find-package name)
+                                               (error "clim-clog/tests: suite package ~a is not loaded."
+                                                      name))))
+                                  (unless (uiop:symbol-call :parachute :package-tests pkg)
+                                    (error "clim-clog/tests: suite package ~a defines no test."
+                                           name))
+                                  pkg))
+                              suites))
+                           (result (uiop:symbol-call :parachute :test packages)))
                       (when (uiop:symbol-call :parachute :results-with-status
                                               :failed result)
                         (error "clim-clog/tests: one or more tests failed.")))))

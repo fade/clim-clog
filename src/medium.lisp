@@ -25,7 +25,7 @@
 ;;;; filled text               CLOG:FILL-TEXT
 ;;;; outlined text             CLOG:STROKE-TEXT
 ;;;; text metrics              CLOG:MEASURE-TEXT
-;;;; clear a region            CLOG:CLEAR-RECT
+;;;; clear a region            CLOG:FILL-RECT (background)
 ;;;;
 ;;;; STATUS (Phase 3): interactive.  Inks are handled for solid colours;
 ;;;; transformations are applied to coordinates; drawing is double-buffered
@@ -71,25 +71,31 @@
 ;;; Helpers: CLIM -> CSS
 ;;; ------------------------------------------------------------------
 
-(defun ink->css (ink)
-  "Translate a CLIM INK to a CSS colour string.
+(defun ink->css (ink &optional medium)
+  "Return a CSS colour string for the CLIM INK.
 
-Solid colours and the standard indirect inks are handled.  +FLIPPING-INK+
-and +TRANSPARENT-INK+ render as fully transparent: the command loop uses
-+FLIPPING-INK+ for XOR presentation highlighting, which a 2D canvas cannot
-do directly, so we no-op it (true highlight via canvas compositing is a
-Roadmap item; hover feedback comes from the pointer-documentation pane).
-Patterns and gradients are also Roadmap items and fall back to black."
+A solid colour renders as rgb().  Without MEDIUM, +FOREGROUND-INK+ and
++BACKGROUND-INK+ render black and white.  With MEDIUM they resolve one
+level through MEDIUM-FOREGROUND and MEDIUM-BACKGROUND, so an indirect ink
+stored as a medium colour renders as it would without MEDIUM.
++FLIPPING-INK+ and +TRANSPARENT-INK+ render fully transparent: a 2D canvas
+has no XOR mode.  Any other ink renders black."
   (cond
     ((typep ink 'clim:color)
      (multiple-value-bind (r g b) (clim:color-rgb ink)
        (format nil "rgb(~d,~d,~d)"
                (round (* 255 r)) (round (* 255 g)) (round (* 255 b)))))
-    ((eq ink clim:+foreground-ink+) "black")
-    ((eq ink clim:+background-ink+) "white")
+    ((eq ink clim:+foreground-ink+)
+     (if medium (ink->css (medium-foreground medium) nil) "black"))
+    ((eq ink clim:+background-ink+)
+     (if medium (ink->css (medium-background medium) nil) "white"))
     ((or (eq ink clim:+transparent-ink+) (eq ink clim:+flipping-ink+))
      "rgba(0,0,0,0)")
     (t "black")))
+
+(defun clear-area-style (medium)
+  "Return the CSS fill a cleared area takes: MEDIUM's background through INK->CSS."
+  (ink->css (medium-background medium) medium))
 
 (defun text-style->css (text-style)
   "Translate a CLIM TEXT-STYLE to a CSS `font' shorthand string, e.g.
@@ -171,14 +177,14 @@ T (a default on/off pattern), or a sequence of segment lengths."
 (defun apply-stroke-state (ctx medium)
   "Push MEDIUM's ink, line thickness and dash pattern onto the context."
   (let ((line-style (medium-line-style medium)))
-    (setf (clog:stroke-style ctx) (ink->css (medium-ink medium)))
+    (setf (clog:stroke-style ctx) (ink->css (medium-ink medium) medium))
     (setf (clog:line-width ctx)
           (max 1 (round (line-style-thickness line-style))))
     (clog:set-line-dash ctx (%dash-array-js line-style))))
 
 (defun apply-fill-state (ctx medium)
   "Push MEDIUM's ink onto the context as fill state."
-  (setf (clog:fill-style ctx) (ink->css (medium-ink medium))))
+  (setf (clog:fill-style ctx) (ink->css (medium-ink medium) medium)))
 
 ;;; ------------------------------------------------------------------
 ;;; Clipping
@@ -300,32 +306,63 @@ responsible for begin-path and the fill/stroke step."
                                    (elt position-seq (+ i 2)) (elt position-seq (+ i 3))
                                    filled)))
 
+(defun %ellipse-parameter (r1x r1y r2x r2y det angle)
+  "Return the unit-circle parameter of the point where the ray at CLIM ANGLE
+meets the ellipse whose radius matrix has the columns (R1X, R1Y) and (R2X, R2Y)
+and the non-zero determinant DET.  The ray points along (cos ANGLE, -sin ANGLE)
+on the y-down canvas."
+  (let ((dx (cos angle))
+        (dy (- (sin angle))))
+    (atan (/ (- (* r1x dy) (* r1y dx)) det)
+          (/ (- (* r2y dx) (* r2x dy)) det))))
+
 (defmethod medium-draw-ellipse* ((medium clog-medium) center-x center-y
                                  radius-1-dx radius-1-dy radius-2-dx radius-2-dy
                                  start-angle end-angle filled)
-  ;; CLIM specifies an ellipse by a centre and two radius vectors R1, R2 that
-  ;; need not be orthogonal (a general/skewed ellipse).  Rather than reduce
-  ;; them to canvas ellipse()'s radius-x / radius-y / rotation -- which is only
-  ;; exact when R1 _|_ R2 -- we install the affine map that sends the unit
-  ;; circle to the ellipse and draw a unit arc through it.  A point (cos a,
-  ;; sin a) on the unit circle maps to centre + cos a * R1 + sin a * R2, i.e.
-  ;; the canvas matrix [a b c d e f] = [R1x R1y R2x R2y Cx Cy].  This is exact
-  ;; for any (including skewed) radii.  The clip path was already rasterised in
-  ;; device space before this transform, so it still applies correctly.
-  (with-clipped-context (ctx medium)
-    (with-device-position (cx cy medium center-x center-y)
-      (clog:canvas-save ctx)
-      (unwind-protect
-           (progn
-             (clog:transform ctx
-                             (%js radius-1-dx) (%js radius-1-dy)
-                             (%js radius-2-dx) (%js radius-2-dy)
-                             cx cy)
-             (clog:begin-path ctx)
-             (clog:arc ctx 0 0 1 (%js start-angle) (%js end-angle))
-             (cond (filled (apply-fill-state ctx medium)  (clog:path-fill ctx))
-                   (t      (apply-stroke-state ctx medium) (clog:path-stroke ctx))))
-        (clog:canvas-restore ctx)))))
+  ;; CLIM gives an ellipse as a centre and two radius vectors R1, R2 that need
+  ;; not be orthogonal.  The path is built through the affine map that sends
+  ;; the unit circle to the ellipse, the canvas matrix [R1x R1y R2x R2y Cx Cy],
+  ;; which is exact for skewed radii.  The map is restored before the paint:
+  ;; the path keeps its shape and lineWidth stays in device pixels.
+  ;;
+  ;; CLIM angles are rays measured counter-clockwise from the positive x axis
+  ;; on the y-down canvas; a ray at angle A points along (cos A, -sin A).
+  ;; %ELLIPSE-PARAMETER maps each angle to the unit circle.  The arc sweeps
+  ;; counter-clockwise on screen, which on the unit circle is counter-clockwise
+  ;; when the matrix's determinant is positive and clockwise when it is
+  ;; negative; the canvas's anticlockwise argument selects the sense.  CLOG
+  ;; prints that argument with ~A, so it is passed as the string "true".
+  ;;
+  ;; A sweep of 2 pi or more is the whole ellipse, with no centre point.  A
+  ;; filled arc of less is a pie from the centre.  With a zero determinant (a
+  ;; flat ellipse), nothing is drawn.
+  (let ((det (- (* radius-1-dx radius-2-dy) (* radius-2-dx radius-1-dy))))
+    (unless (climi::coordinate= det 0)
+      (with-clipped-context (ctx medium)
+        (with-device-position (cx cy medium center-x center-y)
+          (clog:canvas-save ctx)
+          (unwind-protect
+               (progn
+                 (clog:transform ctx
+                                 (%js radius-1-dx) (%js radius-1-dy)
+                                 (%js radius-2-dx) (%js radius-2-dy)
+                                 cx cy)
+                 (clog:begin-path ctx)
+                 (if (climi::coordinate<= (* 2 pi) (- end-angle start-angle))
+                     (clog:arc ctx 0 0 1 0 (%js (* 2 pi)))
+                     (flet ((parameter (angle)
+                              (%js (%ellipse-parameter radius-1-dx radius-1-dy
+                                                       radius-2-dx radius-2-dy
+                                                       det angle))))
+                       (when filled
+                         (clog:move-to ctx 0 0))
+                       (clog:arc ctx 0 0 1 (parameter start-angle) (parameter end-angle)
+                                 :anticlockwise (and (plusp det) "true"))
+                       (when filled
+                         (clog:close-path ctx)))))
+            (clog:canvas-restore ctx))
+          (cond (filled (apply-fill-state ctx medium)  (clog:path-fill ctx))
+                (t      (apply-stroke-state ctx medium) (clog:path-stroke ctx))))))))
 
 (defun %text-align->css (align-x)
   "Map a CLIM ALIGN-X keyword to a canvas textAlign value."
@@ -374,7 +411,8 @@ label correctly instead of drawing it at the baseline and clipping the top."
   (with-clipped-context (ctx medium)
     (with-device-position (dl dt medium left top)
       (with-device-position (dr db medium right bottom)
-        (clog:clear-rect ctx dl dt (- dr dl) (- db dt))))))
+        (setf (clog:fill-style ctx) (clear-area-style medium))
+        (clog:fill-rect ctx dl dt (- dr dl) (- db dt))))))
 
 ;;; ------------------------------------------------------------------
 ;;; Pixmaps and MEDIUM-COPY-AREA (Phase 3)
@@ -492,7 +530,7 @@ independent of the sample text); EM-WIDTH is the measured advance of \"m\"."
                 (values (* 0.8 px) (* 0.2 px) (* 0.6 px)))
               (progn
                 (setf (clog:font-style ctx) css)
-                (let* ((tm (clog:measure-text ctx "m"))
+                (let* ((tm (%measure-text ctx "m"))
                        (asc (clog:font-bounding-box-ascent tm))
                        (desc (clog:font-bounding-box-descent tm))
                        (emw (clog:width tm)))
@@ -510,8 +548,19 @@ independent of the sample text); EM-WIDTH is the measured advance of \"m\"."
               (* 0.6 (%offline-font-px text-style))
               (progn
                 (setf (clog:font-style ctx) css)
-                (let ((w (clog:width (clog:measure-text ctx (string char)))))
+                (let ((w (clog:width (%measure-text ctx (string char)))))
                   (setf (gethash key cache) w))))))))
+
+(defun %measure-text (ctx string)
+  "Return the CLOG:CLOG-TEXT-METRICS CLOG measures for STRING in CTX's current
+font, STRING escaped for the single-quoted JavaScript literal CLOG splices it
+into."
+  ;; CLOG:MEASURE-TEXT splices its text into a single-quoted JavaScript
+  ;; literal unescaped, whereas CLOG:FILL-TEXT escapes it, so a quote,
+  ;; backslash, or newline breaks the script and the width reads back 0.
+  ;; Drop this escape when CLOG's MEASURE-TEXT escapes its text, or the
+  ;; text is escaped twice.
+  (clog:measure-text ctx (clog:escape-string string)))
 
 (defmethod text-style-ascent (text-style (medium clog-medium))
   (values (%font-metrics medium text-style)))
