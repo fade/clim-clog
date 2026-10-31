@@ -17,7 +17,8 @@
                 #:is
                 #:true)
   (:import-from #:clim-clog/tests/recording-context
-                #:make-recording-context))
+                #:make-recording-context
+                #:recorded-scripts))
 
 (in-package #:clim-clog/tests/window-resize)
 
@@ -125,6 +126,18 @@ newest first."))
     ((frame floored-test-frame) width height)
   (call-next-method frame (max 800 width) (max 600 height)))
 
+(defclass painted-pane (basic-pane)
+  ()
+  (:documentation "A pane that draws a rectangle on every repaint."))
+
+(defmethod handle-repaint ((pane painted-pane) region)
+  (declare (ignore region))
+  (draw-rectangle* pane 10 10 110 60 :ink +red+))
+
+(define-application-frame painted-test-frame (resize-test-frame)
+  ()
+  (:pane (make-pane 'painted-pane)))
+
 ;;; ------------------------------------------------------------------
 ;;; Driving a resize.
 
@@ -177,6 +190,22 @@ Return true when FRAME was told."
     (list (clim-clog::clog-mirror-canvas mirror)
           (clim-clog::clog-mirror-offscreen-canvas mirror))))
 
+(defun handle-pending-events (frame)
+  "Handle the events already queued for FRAME, without waiting for more."
+  (let ((sheet (frame-top-level-sheet frame)))
+    (loop for event = (event-read-no-hang sheet)
+          while event
+          do (handle-event (event-sheet event) event))))
+
+(defun mirror-script-counts (frame)
+  "Two values for FRAME's mirror: the number of blits sent to the visible
+context, and the number of scripts sent to the offscreen context."
+  (let ((mirror (sheet-direct-mirror (frame-top-level-sheet frame))))
+    (values (count-if (lambda (script) (search "drawImage(" script))
+                      (recorded-scripts (clim-clog::clog-mirror-context mirror)))
+            (length (recorded-scripts
+                     (clim-clog::clog-mirror-offscreen-context mirror))))))
+
 ;;; ------------------------------------------------------------------
 ;;; The tests.
 
@@ -219,6 +248,20 @@ Return true when FRAME was told."
           (bounding-rectangle-size (frame-top-level-sheet frame))))
      (dolist (canvas (mirror-canvases frame))
        (is equal '("800" "600") (canvas-size canvas))))))
+
+(define-test a-resize-presents-once
+  (call-with-tab
+   'painted-test-frame
+   (lambda (frame port body)
+     (declare (ignore port))
+     (enable-frame frame)
+     (handle-pending-events frame)
+     (multiple-value-bind (blits drawn) (mirror-script-counts frame)
+       (true (resize-tab frame body "1400:900"))
+       (handle-pending-events frame)
+       (multiple-value-bind (blits-after drawn-after) (mirror-script-counts frame)
+         (true (> drawn-after drawn))
+         (is = 1 (- blits-after blits)))))))
 
 (define-test the-browser-debounces-the-resize
   (call-with-tab

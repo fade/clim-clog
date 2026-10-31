@@ -280,8 +280,9 @@ the port's configured size when the sheet region is degenerate."
           ;; -- even to its current value -- resets the canvas bitmap to
           ;; transparent, which on a visible canvas reads as a page flash.
           ;; So only touch the bitmap when the size actually changes, and
-          ;; after a real resize immediately re-blit the offscreen so the
-          ;; viewer never sees the blanked frame between resize and repaint.
+          ;; after a real resize request a re-blit of the offscreen: at once
+          ;; outside a coalescing scope, otherwise once when the scope ends,
+          ;; after the repaint the resize causes.
           (unless (and (eql w cur-w) (eql h cur-h))
             (ignore-errors
              (setf (clog:property canvas "width")  (princ-to-string w)
@@ -292,7 +293,7 @@ the port's configured size when the sheet region is degenerate."
              ;; so re-apply the blit composite mode on the visible context.
              (setf (clog:global-composite-operation (clog-mirror-context mirror))
                    "copy")
-             (clog-mirror-flush mirror))))))
+             (request-mirror-flush mirror))))))
     (values x1 y1 x2 y2)))
 
 ;;; The double-buffer page-flip hook.  CLIM's display functions only *record*
