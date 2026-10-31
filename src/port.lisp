@@ -86,6 +86,8 @@
   ;; Every port needs at least one frame manager registered.
   (push (make-instance 'clog-frame-manager :port port)
         (slot-value port 'climi::frame-managers))
+  ;; Follow browser window resizes (see resize.lisp).
+  (install-browser-resize-handler port)
   ;; Start the port I/O loop (a thread looping PROCESS-NEXT-EVENT), the
   ;; single consumer of our event queue.  CLX does this here too.
   (restart-port port))
