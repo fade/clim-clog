@@ -64,7 +64,8 @@
                (:file "coalesced-frames" :depends-on ("mock-connection"))
                (:file "input-order" :depends-on ("mock-connection"))
                (:file "window-resize"
-                :depends-on ("recording-context" "mock-connection")))
+                :depends-on ("recording-context" "mock-connection"))
+               (:file "reader-thread" :depends-on ("mock-connection")))
   :perform (test-op (o c)
                     (declare (ignore o c))
                     (let* ((suites '("CLIM-CLOG/TESTS/MEDIUM-METRICS"
@@ -74,7 +75,8 @@
                                      "CLIM-CLOG/TESTS/ELLIPSE-ARCS"
                                      "CLIM-CLOG/TESTS/COALESCED-FRAMES"
                                      "CLIM-CLOG/TESTS/INPUT-ORDER"
-                                     "CLIM-CLOG/TESTS/WINDOW-RESIZE"))
+                                     "CLIM-CLOG/TESTS/WINDOW-RESIZE"
+                                     "CLIM-CLOG/TESTS/READER-THREAD"))
                            (packages
                              (mapcar
                               (lambda (name)

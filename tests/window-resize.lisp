@@ -30,7 +30,8 @@
                 #:release-mock-socket
                 #:release-mock-port
                 #:stop-port-event-loop
-                #:deliver-browser-message))
+                #:deliver-browser-message
+                #:reader-thread-queries))
 
 (in-package #:clim-clog/tests/window-resize)
 
@@ -496,6 +497,7 @@ context, and the number of scripts sent to the offscreen context."
                       canvas-id))
              (is equal '(clim-clog:browser-window-resize-event
                          pointer-button-press-event)
-                 (queued-event-types port))))
+                 (queued-event-types port))
+             (is equal '() (reader-thread-queries socket))))
       (when port (release-mock-port port))
       (release-mock-socket socket))))
