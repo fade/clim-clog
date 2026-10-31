@@ -253,12 +253,68 @@ reader thread (see CANVAS-MESSAGE-HANDLER)."
   "Stop handling CANVAS's events on the websocket reader thread."
   (forget-reader-thread-hooks canvas *canvas-events*))
 
+;;; CLOG's websocket message handlers.
+;;;
+;;; CLOG-CONNECTION::HANDLE-MESSAGE runs on the websocket reader thread and,
+;;; before its own dispatch, calls each function in the unexported list
+;;; CLOG-CONNECTION::*MESSAGE-HANDLERS* (upstream CLOG commit 3b27576, first
+;;; released in CLOG 2.4).  clim-clog relies on this contract:
+;;;   - a handler is called with two arguments: the websocket message split
+;;;     at its first colon, a list of its type and body, and the connection
+;;;     id, which is NIL for a connection CLOG no longer knows;
+;;;   - a non-NIL return means the message is handled: CLOG calls no later
+;;;     handler and does not dispatch the message itself;
+;;;   - HANDLE-MESSAGE wraps the calls in a HANDLER-CASE for every condition,
+;;;     so an error a handler does not handle is logged by CLOG and does not
+;;;     reach the debugger.
+;;; CANVAS-MESSAGE-HANDLER is the only handler clim-clog adds.  No error from
+;;; it reaches that HANDLER-CASE: it logs the error, or invokes the debugger
+;;; itself when CLOG-CONNECTION:*BREAK-ON-ERROR* is true (see
+;;; %CALL-READER-THREAD-HANDLER).
+(defun clog-message-handlers-symbol ()
+  "Return CLOG-CONNECTION::*MESSAGE-HANDLERS*, the symbol whose value is the
+list of CLOG's websocket message handlers.  Signal an error when the loaded
+CLOG does not define it as a list: without it, no handler runs on the reader
+thread."
+  (let ((symbol (find-symbol "*MESSAGE-HANDLERS*" '#:clog-connection)))
+    (unless (and symbol (boundp symbol) (listp (symbol-value symbol)))
+      (error "clim-clog requires a CLOG whose CLOG-CONNECTION::*MESSAGE-HANDLERS* ~
+is a list of message handlers (upstream CLOG commit 3b27576, December 2024, ~
+first released in CLOG 2.4).  The loaded CLOG ~:[does not define it~;~
+defines it, but not as a list~]."
+             (and symbol (boundp symbol))))
+    symbol))
+
+(defun %call-reader-thread-handler (handler data)
+  "Call HANDLER with DATA under the error rules CANVAS-MESSAGE-HANDLER
+describes.  When CLOG-CONNECTION:*BREAK-ON-ERROR* is true, an error invokes
+the debugger directly, since the HANDLER-CASE in
+CLOG-CONNECTION::HANDLE-MESSAGE would otherwise handle it first."
+  (if clog-connection:*break-on-error*
+      (with-simple-restart (abort "Drop this clim-clog event and return to ~
+the CLOG websocket reader.")
+        (handler-bind ((error #'invoke-debugger))
+          (funcall handler data)))
+      (handler-case (funcall handler data)
+        (error (e)
+          (format *error-output* "~&[clim-clog input] ~a~%" e)))))
+
 (defun canvas-message-handler (message connection-id)
   "Run the handler of an event that clim-clog registered for the reader
 thread, on the calling thread: a canvas input event or a window resize.
 MESSAGE is CLOG's split websocket message, a list of its type and body.
-Return true when the message was such an event and was handled, NIL to
-leave it to CLOG.  An error in the handler is logged, not signalled."
+Return true when the message was such an event, NIL to leave it to CLOG.
+
+An error in the handler:
+  - is logged to *ERROR-OUTPUT* when CLOG-CONNECTION:*BREAK-ON-ERROR* is
+    false;
+  - enters the debugger, with an ABORT restart that drops the event, when
+    it is true.
+The debugger runs on the websocket reader thread, so the connection reads no
+further message, query answers included, until a restart is chosen.  The
+connection's \"clog-debug\" hook is never called, whatever
+CLOG-CONNECTION:*DISABLE-CLOG-DEBUGGING* holds: a browser-based debugger's
+answer arrives on the reader thread it would block."
   (when (and connection-id
              (equal (first message) "E")
              (stringp (second message)))
@@ -270,12 +326,11 @@ leave it to CLOG.  An error in the handler is logged, not signalled."
       (when (and table (canvas-event-hook-p table hook))
         (let ((handler (gethash hook table)))
           (when handler
-            (handler-case (funcall handler data)
-              (error (e)
-                (format *error-output* "~&[clim-clog input] ~a~%" e)))
+            (%call-reader-thread-handler handler data)
             t))))))
 
-(pushnew 'canvas-message-handler clog-connection::*message-handlers*)
+(pushnew 'canvas-message-handler
+         (symbol-value (clog-message-handlers-symbol)))
 
 (defun install-clog-input-handlers (port sheet canvas)
   "Attach CLOG pointer, wheel, and keyboard handlers on CANVAS that enqueue
