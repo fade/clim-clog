@@ -54,9 +54,9 @@
    (context :initarg :context :initform nil :accessor clog-port-context)
    (width   :initarg :width   :initform 800 :accessor clog-port-width)
    (height  :initarg :height  :initform 600 :accessor clog-port-height)
-   ;; Phase 2 input: CLOG event handlers (running in CLOG worker threads)
-   ;; push CLIM events here; the port I/O loop drains them in
-   ;; PROCESS-NEXT-EVENT (see input.lisp).
+   ;; The canvas event handlers, run on CLOG's websocket reader thread in
+   ;; arrival order, push CLIM events here; the port I/O loop drains them
+   ;; in PROCESS-NEXT-EVENT (see input.lisp).
    (event-queue :initform '() :accessor clog-port-event-queue)
    (event-lock  :initform (clim-sys:make-recursive-lock "clog event queue")
                 :reader clog-port-event-lock)
@@ -124,6 +124,52 @@ DRAW-IMAGE.  This is the double-buffer page-flip."
   (clog:draw-image (clog-mirror-context mirror)
                    (clog-mirror-offscreen-canvas mirror)
                    0 0))
+
+;;; ------------------------------------------------------------------
+;;; Coalesced flushes
+;;;
+;;; McCLIM repaints a stream pane once per finished line of output, and each
+;;; repaint asks for a flush, so one redisplay would present one frame per
+;;; line, the first showing the pane just cleared.  Inside a coalescing scope
+;;; a flush request only marks the mirror, and the outermost scope presents
+;;; each marked mirror once on exit.  Scopes wrap event handling and frame
+;;; redisplay (see coalesced-flush.lisp).  Outside any scope a request blits
+;;; at once.
+;;; ------------------------------------------------------------------
+
+(defvar *mirrors-awaiting-flush* :immediate
+  "The mirrors whose flush the current coalescing scope has deferred, newest
+first, or :IMMEDIATE outside any scope.  Bound per thread.")
+
+(defun request-mirror-flush (mirror)
+  "Present MIRROR's offscreen buffer: at once outside a coalescing scope,
+otherwise when the outermost scope ends."
+  (if (eq *mirrors-awaiting-flush* :immediate)
+      (clog-mirror-flush mirror)
+      (pushnew mirror *mirrors-awaiting-flush*)))
+
+(defun flush-awaiting-mirrors ()
+  "Blit each mirror the current coalescing scope has deferred, oldest first,
+and empty the set.  A failed blit is skipped.  Outside a scope, do nothing."
+  (unless (eq *mirrors-awaiting-flush* :immediate)
+    (let ((mirrors (reverse *mirrors-awaiting-flush*)))
+      (setf *mirrors-awaiting-flush* '())
+      (dolist (mirror mirrors)
+        (ignore-errors (clog-mirror-flush mirror))))))
+
+(defun call-with-coalesced-flushes (function)
+  "Call FUNCTION with mirror flushes deferred, and on any exit blit each
+mirror it asked to flush, once.  Inside an enclosing scope, only call
+FUNCTION: the outermost scope presents."
+  (if (eq *mirrors-awaiting-flush* :immediate)
+      (let ((*mirrors-awaiting-flush* '()))
+        (unwind-protect (funcall function)
+          (flush-awaiting-mirrors)))
+      (funcall function)))
+
+(defmacro with-coalesced-flushes (() &body body)
+  "Run BODY in a coalescing scope; see CALL-WITH-COALESCED-FLUSHES."
+  `(call-with-coalesced-flushes (lambda () ,@body)))
 
 ;;; ------------------------------------------------------------------
 ;;; Pixmaps (Phase 3)
@@ -201,6 +247,7 @@ the port's configured size when the sheet region is degenerate."
 (defmethod destroy-mirror ((port clog-port) (sheet mirrored-sheet-mixin))
   (let ((mirror (sheet-direct-mirror sheet)))
     (when mirror
+      (forget-canvas-event-hooks (clog-mirror-canvas mirror))
       (ignore-errors (clog:destroy (clog-mirror-canvas mirror)))
       (ignore-errors (clog:destroy (clog-mirror-offscreen-canvas mirror))))))
 
@@ -242,15 +289,16 @@ the port's configured size when the sheet region is degenerate."
 ;;; output; the actual drawing to the medium happens during repaint, when
 ;;; DISPATCH-REPAINT replays the records.  REPAINT-SHEET is invoked on the
 ;;; mirrored ancestor and recurses into its (non-mirrored) child panes, so an
-;;; :AFTER here fires exactly once after the whole subtree has been drawn into
-;;; the offscreen buffer -- covering the initial paint and every partial
-;;; repaint (e.g. presentation highlighting).  MEDIUM-FINISH-OUTPUT also
-;;; blits, for code paths that draw and explicitly finish output.
+;;; :AFTER here fires once after the whole subtree has been drawn into the
+;;; offscreen buffer, covering the initial paint and every partial repaint
+;;; (e.g. presentation highlighting).  MEDIUM-FINISH-OUTPUT also asks for a
+;;; flush.  Inside a coalescing scope the request waits for the scope's end.
+
 (defmethod repaint-sheet :after ((sheet mirrored-sheet-mixin) region)
   (declare (ignore region))
   (let ((mirror (sheet-direct-mirror sheet)))
     (when (typep mirror 'clog-mirror)
-      (ignore-errors (clog-mirror-flush mirror)))))
+      (ignore-errors (request-mirror-flush mirror)))))
 
 (defmethod enable-mirror  ((port clog-port) (sheet mirrored-sheet-mixin)) nil)
 (defmethod disable-mirror ((port clog-port) (sheet mirrored-sheet-mixin)) nil)

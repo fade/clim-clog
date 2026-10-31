@@ -25,6 +25,7 @@
    (:file "graft"         :depends-on ("package" "port"))
    (:file "medium"        :depends-on ("package" "port"))
    (:file "input"         :depends-on ("package" "port"))
+   (:file "coalesced-flush" :depends-on ("package" "port"))
    (:file "frame-manager" :depends-on ("package" "port" "medium"))))
 
 (defsystem "clim-clog/examples"
@@ -34,15 +35,18 @@
   :components ((:file "hello")))
 
 ;;; Headless contract tests (Parachute), matching the valis/ubik pattern.
-;;; They need no browser or CLOG connection and run in CI.  They cover:
+;;; They need no browser and run in CI.  They cover:
 ;;;   - the medium's default inks;
 ;;;   - its text metrics, via the offline fallback path;
 ;;;   - the factoring of a browser wheel event into scroll-event initargs;
 ;;;   - the text handed to CLOG to measure, recorded by a stand-in canvas
 ;;;     context;
 ;;;   - the canvas calls that drawing an elliptical arc makes, read back from
-;;;     that context by a replay of its recorded scripts.
+;;;     that context by a replay of its recorded scripts;
+;;;   - how many frames one event presents, and the order browser input is
+;;;     queued in, on a frame whose CLOG connection is a recording stand-in.
 ;;; The test-op runs every listed suite package in a single Parachute run.
+
 (defsystem "clim-clog/tests"
   :description "Headless contract tests for the clim-clog medium protocol."
   :depends-on ("clim-clog" "parachute")
@@ -52,14 +56,19 @@
                (:file "wheel-input")
                (:file "recording-context")
                (:file "measured-text" :depends-on ("recording-context"))
-               (:file "ellipse-arcs" :depends-on ("recording-context")))
+               (:file "ellipse-arcs" :depends-on ("recording-context"))
+               (:file "mock-connection")
+               (:file "coalesced-frames" :depends-on ("mock-connection"))
+               (:file "input-order" :depends-on ("mock-connection")))
   :perform (test-op (o c)
                     (declare (ignore o c))
                     (let* ((suites '("CLIM-CLOG/TESTS/MEDIUM-METRICS"
                                      "CLIM-CLOG/TESTS/MEDIUM-PAINT"
                                      "CLIM-CLOG/TESTS/WHEEL-INPUT"
                                      "CLIM-CLOG/TESTS/MEASURED-TEXT"
-                                     "CLIM-CLOG/TESTS/ELLIPSE-ARCS"))
+                                     "CLIM-CLOG/TESTS/ELLIPSE-ARCS"
+                                     "CLIM-CLOG/TESTS/COALESCED-FRAMES"
+                                     "CLIM-CLOG/TESTS/INPUT-ORDER"))
                            (packages
                              (mapcar
                               (lambda (name)
