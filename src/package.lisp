@@ -29,6 +29,9 @@
            #:clog-medium
            #:clog-mirror
            #:clog-frame-manager
+           ;; Presenting several redraws as one frame.
+           #:with-coalesced-flushes
+           #:call-with-coalesced-flushes
            ;; Harness entry points (see examples/hello.lisp).
            #:make-clog-medium-for-context
            #:*clog-server-path*))

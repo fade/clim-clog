@@ -132,9 +132,9 @@ DRAW-IMAGE.  This is the double-buffer page-flip."
 ;;; repaint asks for a flush, so one redisplay would present one frame per
 ;;; line, the first showing the pane just cleared.  Inside a coalescing scope
 ;;; a flush request only marks the mirror, and the outermost scope presents
-;;; each marked mirror once on exit.  Scopes wrap event handling and frame
-;;; redisplay (see coalesced-flush.lisp).  Outside any scope a request blits
-;;; at once.
+;;; each marked mirror once on exit.  Scopes wrap event handling, frame
+;;; redisplay, and input editing (see coalesced-flush.lisp).  Outside any
+;;; scope a request blits at once.
 ;;; ------------------------------------------------------------------
 
 (defvar *mirrors-awaiting-flush* :immediate
@@ -158,9 +158,15 @@ and empty the set.  A failed blit is skipped.  Outside a scope, do nothing."
         (ignore-errors (clog-mirror-flush mirror))))))
 
 (defun call-with-coalesced-flushes (function)
-  "Call FUNCTION with mirror flushes deferred, and on any exit blit each
-mirror it asked to flush, once.  Inside an enclosing scope, only call
-FUNCTION: the outermost scope presents."
+  "Call FUNCTION with no arguments in a coalescing scope and return its values.
+
+While the scope is open on the calling thread, a flush of a clog mirror,
+from a repaint or from FORCE-OUTPUT or FINISH-OUTPUT on a pane, is deferred.
+On any exit from the outermost scope, each deferred mirror is blitted once.
+A nested scope only calls FUNCTION; the outermost one presents.  Inside a
+scope, a read from an event queue or input buffer, or a listen on one with
+a timeout other than 0, presents the deferred mirrors first.  Drawing by
+other threads, and to mirrors of other ports, is unaffected."
   (if (eq *mirrors-awaiting-flush* :immediate)
       (let ((*mirrors-awaiting-flush* '()))
         (unwind-protect (funcall function)
@@ -168,7 +174,9 @@ FUNCTION: the outermost scope presents."
       (funcall function)))
 
 (defmacro with-coalesced-flushes (() &body body)
-  "Run BODY in a coalescing scope; see CALL-WITH-COALESCED-FLUSHES."
+  "Run BODY in a coalescing scope and return its values, so the clog mirrors
+it redraws are presented once, on exit, with the finished drawing.  See
+CALL-WITH-COALESCED-FLUSHES for the full contract."
   `(call-with-coalesced-flushes (lambda () ,@body)))
 
 ;;; ------------------------------------------------------------------

@@ -7,12 +7,13 @@
 ;;;; A frame runs on a clog-port whose body lives on a mock connection (see
 ;;;; mock-connection.lisp), so every script CLOG would send to a browser is
 ;;;; recorded.  A presented frame is a drawImage script: the blit of the
-;;;; offscreen canvas onto the visible one.  Each test drives the pane on
-;;;; the calling thread in one of three ways:
+;;;; offscreen canvas onto the visible one.  Each test drives a pane on the
+;;;; calling thread in one of four ways:
 ;;;;   - it hands one event to HANDLE-EVENT, as the frame's command loop does;
 ;;;;   - it redisplays the frame's panes, as the command loop does after a
 ;;;;     command;
-;;;;   - it writes to the pane outside any event.
+;;;;   - it writes to the pane outside any event;
+;;;;   - it accepts a string typed into an interactor.
 ;;;; Each test then reads the scripts that step produced.
 
 (defpackage #:clim-clog/tests/coalesced-frames
@@ -90,6 +91,47 @@ pane does."))
       (when port (release-mock-port port))
       (release-mock-socket socket))))
 
+(define-application-frame typing-frame ()
+  ()
+  (:panes (io :interactor :scroll-bars nil))
+  (:layouts (default io)))
+
+(defun typed-into-interactor (text)
+  "Queue a key press for each character of TEXT and then Return on an
+interactor, ACCEPT a string from it on the calling thread, and return a
+plist of the :VALUE read, the :MESSAGES sent, and the :BLITS among them."
+  (let* ((socket (make-mock-socket))
+         (port nil)
+         (frame nil))
+    (unwind-protect
+         (progn
+           (setf port (make-mock-port socket :width 800 :height 600)
+                 frame (make-application-frame 'typing-frame
+                                               :frame-manager (find-frame-manager :port port)
+                                               :width 800 :height 600))
+           (enable-frame frame)
+           (stop-port-event-loop port)
+           (let ((pane (find-pane-named frame 'io)))
+             (flet ((press (char name)
+                      (queue-event pane (make-instance 'key-press-event
+                                                       :sheet pane
+                                                       :key-name name
+                                                       :key-character char
+                                                       :modifier-state 0))))
+               (loop for char across text
+                     do (press char (intern (string char) :keyword)))
+               (press #\Return :return))
+             (clear-sent-scripts socket)
+             (let* ((value (let ((*application-frame* frame))
+                             (accept 'string :stream pane :prompt "text")))
+                    (scripts (sent-scripts socket)))
+               (list :value value
+                     :messages (length scripts)
+                     :blits (blit-count scripts)))))
+      (when frame (ignore-errors (destroy-frame frame)))
+      (when port (release-mock-port port))
+      (release-mock-socket socket))))
+
 (defun scripts-for (socket pane event)
   "The scripts sent while PANE handles EVENT on the calling thread."
   (clear-sent-scripts socket)
@@ -140,6 +182,15 @@ so no blit presents a cleared or half-drawn pane."
         (text (last-text-position scripts)))
     (and blit text (> blit text))))
 
+(defun history-size (pane)
+  "The number of top-level output records in PANE's output history."
+  (let ((count 0))
+    (map-over-output-records (lambda (record)
+                               (declare (ignore record))
+                               (incf count))
+                             (stream-output-history pane))
+    count))
+
 ;;; ------------------------------------------------------------------
 ;;; One event, one presented frame.
 ;;; ------------------------------------------------------------------
@@ -168,6 +219,28 @@ so no blit presents a cleared or half-drawn pane."
      (let ((scripts (sent-scripts socket)))
        (is = 1 (blit-count scripts))
        (true (presents-finished-frame-p scripts))))))
+
+(define-test repeated-redisplays-keep-one-history
+  (call-with-redrawing-pane
+   (lambda (socket pane)
+     (declare (ignore socket))
+     (let ((frame (pane-frame pane))
+           (counts '()))
+       (let ((*application-frame* frame))
+         (dotimes (i 3)
+           (redisplay-frame-pane frame pane :force-p t)
+           (push (history-size pane) counts)))
+       (is equal (list *line-count* *line-count* *line-count*)
+           (reverse counts))))))
+
+(define-test typing-into-an-interactor-presents-once-per-gesture
+  ;; The input editor echoes from STREAM-READ-GESTURE, after HANDLE-EVENT
+  ;; has returned.  Expect one frame as each gesture is read, which shows
+  ;; the prompt or the previous echo, and one as the editor exits.
+  (let* ((text "abcde")
+         (result (typed-into-interactor text)))
+    (is equal text (getf result :value))
+    (is = (+ (length text) 2) (getf result :blits))))
 
 ;;; ------------------------------------------------------------------
 ;;; Drawing outside an event still reaches the screen.
