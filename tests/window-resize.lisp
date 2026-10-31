@@ -4,21 +4,33 @@
 ;;;; browser window that holds it.
 ;;;;
 ;;;; These need no browser.  A stand-in body, window, and canvas take the place
-;;;; of a tab: they record the scripts and event handlers CLOG would send, and
-;;;; each canvas keeps the properties set on it.  A frame is adopted on a port
-;;;; built over that body, the handler the port binds on the window is called
-;;;; with the data a browser sends, and the events the frame receives are
-;;;; handled on the test thread in place of a running command loop.
+;;;; of a tab: they record every script and every event binding CLOG would
+;;;; send, and each canvas keeps the properties set on it.  SETTLE-RESIZE plays
+;;;; the browser's part for one settled resize: each resize listener the
+;;;; window's scripts installed and did not remove triggers its event, and
+;;;; each jQuery binding of that event sends the data to the handler CLOG
+;;;; holds for it.  The events a frame receives are handled on the test
+;;;; thread in place of a running command loop.  The ordering test instead
+;;;; runs on a mock connection (see mock-connection.lisp), so that CLOG's own
+;;;; message entry point decides which thread runs the handler.
 
 (defpackage #:clim-clog/tests/window-resize
   (:use #:clim #:clim-lisp)
   (:import-from #:parachute
                 #:define-test
                 #:is
-                #:true)
+                #:true
+                #:false)
   (:import-from #:clim-clog/tests/recording-context
                 #:make-recording-context
-                #:recorded-scripts))
+                #:recorded-scripts)
+  (:import-from #:clim-clog/tests/mock-connection
+                #:make-mock-socket
+                #:mock-socket-id
+                #:release-mock-socket
+                #:release-mock-port
+                #:stop-port-event-loop
+                #:deliver-browser-message))
 
 (in-package #:clim-clog/tests/window-resize)
 
@@ -28,10 +40,11 @@
 (defclass stand-in-element ()
   ((scripts :initform '() :accessor %scripts
             :documentation "The scripts sent to the object, newest first.")
-   (handlers :initform '() :accessor %handlers
-             :documentation "An alist of event name to the function CLOG
-would call with the browser's event data."))
-  (:documentation "A CLOG object that records scripts and event handlers in
+   (binds :initform '() :accessor %binds
+          :documentation "Every (EVENT . HANDLER) passed to SET-EVENT, newest
+first.  HANDLER is the function CLOG calls with the browser's event data, or
+NIL for an unbind."))
+  (:documentation "A CLOG object that records scripts and event bindings in
 place of a browser connection."))
 
 (defmethod clog:js-execute ((obj stand-in-element) script)
@@ -44,12 +57,27 @@ place of a browser connection."))
 
 ;;; Every CLOG SET-ON-* function binds its handler through SET-EVENT, which
 ;;; is given the function CLOG calls with the event data.
+
 (defmethod clog::set-event ((obj stand-in-element) event handler
                             &key &allow-other-keys)
-  (setf (%handlers obj)
-        (cons (cons event handler)
-              (remove event (%handlers obj) :key #'car :test #'equal)))
+  (push (cons event handler) (%binds obj))
   obj)
+
+(defun bound-handler (obj event)
+  "The handler CLOG holds for EVENT on OBJ: the one given by the newest bind
+of EVENT, or NIL when that bind was an unbind or there is none."
+  (cdr (assoc event (%binds obj) :test #'equal)))
+
+(defun jquery-binding-count (obj event)
+  "How many jQuery handlers for EVENT the binds left on OBJ.  Each bind with
+a handler adds one with .on, and an unbind removes them all with .off."
+  (let ((count 0))
+    (loop for (name . handler) in (%binds obj)
+          when (equal name event)
+            do (if handler
+                   (incf count)
+                   (return)))
+    count))
 
 (defclass stand-in-window (stand-in-element clog:clog-window) ())
 
@@ -105,6 +133,42 @@ first.")))
   "CANVAS's width and height properties, as a list of two strings."
   (list (clog:property canvas "width") (clog:property canvas "height")))
 
+(defun resize-listeners (window)
+  "The resize listeners WINDOW's scripts installed and did not remove, oldest
+first, each a list of the jQuery target and the event name it triggers.  A
+script calling addEventListener('resize', ...) whose callback triggers an
+event installs one.  A script calling removeEventListener('resize', ...) for
+a listener stored under that event name removes it."
+  (let ((listeners '()))
+    (dolist (script (reverse (%scripts window)) (reverse listeners))
+      (cond ((search "addEventListener('resize'" script)
+             (multiple-value-bind (match groups)
+                 (cl-ppcre:scan-to-strings
+                  "(\\$\\([^)]*\\))\\.trigger\\('([^']+)'" script)
+               (when match
+                 (push (list (aref groups 0) (aref groups 1)) listeners))))
+            ((search "removeEventListener('resize'" script)
+             (multiple-value-bind (match groups)
+                 (cl-ppcre:scan-to-strings "\\['([^']+)'\\]" script)
+               (when match
+                 (setf listeners
+                       (remove (aref groups 0) listeners
+                               :key #'second :test #'equal :count 1)))))))))
+
+(defun settle-resize (window data)
+  "Play one settled browser resize to DATA on WINDOW.  Each listener whose
+trigger target is WINDOW's jQuery object triggers its event, and each jQuery
+binding of that event calls the handler CLOG holds for it with DATA.  Return
+the number of handler calls."
+  (let ((calls 0))
+    (loop for (target event) in (resize-listeners window)
+          for handler = (bound-handler window event)
+          when (and handler (equal target (clog:jquery window)))
+            do (loop repeat (jquery-binding-count window event)
+                     do (funcall handler data)
+                        (incf calls)))
+    calls))
+
 ;;; ------------------------------------------------------------------
 ;;; Frames that record each resize they are told of.
 
@@ -159,43 +223,36 @@ Destroy the port after."
            (funcall function frame port body))
       (destroy-port port))))
 
-(defun resize-handler (body)
-  "The handler bound on BODY's window for the resize, or NIL."
-  (cdr (first (%handlers (clog:window body)))))
-
 (defun resize-tab (frame body data)
-  "Call the window's resize handler with DATA as CLOG would, then handle the
-events FRAME receives until FRAME is told of the resize or a second passes.
-Return true when FRAME was told."
-  (let ((handler (resize-handler body))
-        (told (length (frame-resizes frame)))
+  "Settle a browser resize to DATA on BODY's window, then handle the events
+FRAME receives until FRAME is told of the resize or a second passes.  Return
+true when FRAME was told."
+  (let ((told (length (frame-resizes frame)))
         (sheet (frame-top-level-sheet frame))
         (deadline (+ (get-internal-real-time) internal-time-units-per-second)))
-    (when handler
-      (funcall handler data)
-      (loop
-        (let ((event (event-read-no-hang sheet)))
-          (cond (event
-                 (handle-event (event-sheet event) event))
-                ((> (length (frame-resizes frame)) told)
-                 (return t))
-                ((> (get-internal-real-time) deadline)
-                 (return nil))
-                (t
-                 (sleep 0.01))))))))
+    (settle-resize (clog:window body) data)
+    (loop
+      (let ((event (event-read-no-hang sheet)))
+        (cond (event
+               (handle-event (event-sheet event) event))
+              ((> (length (frame-resizes frame)) told)
+               (return t))
+              ((> (get-internal-real-time) deadline)
+               (return nil))
+              (t
+               (sleep 0.01)))))))
 
-(defun mirror-canvases (frame)
-  "The visible and offscreen canvases of FRAME's top-level sheet."
-  (let ((mirror (sheet-direct-mirror (frame-top-level-sheet frame))))
+(defun mirror-canvases (sheet)
+  "The visible and offscreen canvases of SHEET's mirror."
+  (let ((mirror (sheet-direct-mirror sheet)))
     (list (clim-clog::clog-mirror-canvas mirror)
           (clim-clog::clog-mirror-offscreen-canvas mirror))))
 
-(defun handle-pending-events (frame)
-  "Handle the events already queued for FRAME, without waiting for more."
-  (let ((sheet (frame-top-level-sheet frame)))
-    (loop for event = (event-read-no-hang sheet)
-          while event
-          do (handle-event (event-sheet event) event))))
+(defun handle-pending-events (sheet)
+  "Handle the events already queued for SHEET, without waiting for more."
+  (loop for event = (event-read-no-hang sheet)
+        while event
+        do (handle-event (event-sheet event) event)))
 
 (defun mirror-script-counts (frame)
   "Two values for FRAME's mirror: the number of blits sent to the visible
@@ -206,15 +263,47 @@ context, and the number of scripts sent to the offscreen context."
             (length (recorded-scripts
                      (clim-clog::clog-mirror-offscreen-context mirror))))))
 
+(defun port-size (port)
+  "PORT's width and height, as a list."
+  (list (clim-clog::clog-port-width port) (clim-clog::clog-port-height port)))
+
 ;;; ------------------------------------------------------------------
 ;;; The tests.
 
 (define-test the-port-binds-one-resize-handler-on-the-window
-  (call-with-tab 'resize-test-frame
-                 (lambda (frame port body)
-                   (declare (ignore frame port))
-                   (is = 1 (length (%handlers (clog:window body))))
-                   (true (resize-handler body)))))
+  (call-with-tab
+   'resize-test-frame
+   (lambda (frame port body)
+     (declare (ignore frame port))
+     (let* ((window (clog:window body))
+            (listeners (resize-listeners window)))
+       (is = 1 (length listeners))
+       (is = 1 (count-if #'cdr (%binds window)))
+       (when listeners
+         (destructuring-bind (target event) (first listeners)
+           (is equal (clog:jquery window) target)
+           (true (bound-handler window event))
+           (is = 1 (jquery-binding-count window event))))))))
+
+(define-test each-port-on-a-body-hears-each-resize-once
+  (let* ((body (make-stand-in-body))
+         (window (clog:window body))
+         (ports (loop for width in '(1280 1100)
+                      collect (make-instance
+                               'clim-clog:clog-port
+                               :server-path (list :clog :body body
+                                                  :width width :height 600)))))
+    (unwind-protect
+         (destructuring-bind (first-port second-port) ports
+           (is = 2 (settle-resize window "1400:900"))
+           (is equal '(1400 900) (port-size first-port))
+           (is equal '(1400 900) (port-size second-port))
+           (destroy-port first-port)
+           (is = 1 (settle-resize window "1000:700"))
+           (is equal '(1400 900) (port-size first-port))
+           (is equal '(1000 700) (port-size second-port)))
+      (dolist (port ports)
+        (ignore-errors (destroy-port port))))))
 
 (define-test the-frame-follows-a-window-resize
   (call-with-tab
@@ -225,13 +314,11 @@ context, and the number of scripts sent to the offscreen context."
      (is equal '(1400 900)
          (multiple-value-list
           (bounding-rectangle-size (frame-top-level-sheet frame))))
-     (is equal '(1400 900)
-         (list (clim-clog::clog-port-width port)
-               (clim-clog::clog-port-height port)))
+     (is equal '(1400 900) (port-size port))
      (is equal '(1400 900)
          (multiple-value-list
           (bounding-rectangle-size (find-graft :port port))))
-     (dolist (canvas (mirror-canvases frame))
+     (dolist (canvas (mirror-canvases (frame-top-level-sheet frame)))
        (is equal '("1400" "900") (canvas-size canvas))))))
 
 (define-test the-application-can-floor-the-frame-size
@@ -240,14 +327,55 @@ context, and the number of scripts sent to the offscreen context."
    (lambda (frame port body)
      (true (resize-tab frame body "700:500"))
      (is equal '((700 500)) (frame-resizes frame))
-     (is equal '(700 500)
-         (list (clim-clog::clog-port-width port)
-               (clim-clog::clog-port-height port)))
+     (is equal '(700 500) (port-size port))
      (is equal '(800 600)
          (multiple-value-list
           (bounding-rectangle-size (frame-top-level-sheet frame))))
-     (dolist (canvas (mirror-canvases frame))
+     (dolist (canvas (mirror-canvases (frame-top-level-sheet frame)))
        (is equal '("800" "600") (canvas-size canvas))))))
+
+(define-test menus-and-dialogs-keep-their-size
+  (call-with-tab
+   'resize-test-frame
+   (lambda (frame port body)
+     (enable-frame frame)
+     (handle-pending-events (frame-top-level-sheet frame))
+     (let* ((manager (find-frame-manager :port port))
+            (*application-frame* frame)
+            (menu (climi::make-menu-frame
+                   (make-pane-1 manager frame 'basic-pane
+                                :width 120 :height 80)))
+            (dialog (make-application-frame 'resize-test-frame
+                                            :calling-frame frame
+                                            :frame-manager manager
+                                            :width 300 :height 200)))
+       (adopt-frame manager menu)
+       (enable-frame menu)
+       (enable-frame dialog)
+       (true (clim-clog:frame-follows-browser-window-p frame))
+       (false (clim-clog:frame-follows-browser-window-p menu))
+       (false (clim-clog:frame-follows-browser-window-p dialog))
+       (let* ((sheets (list (frame-top-level-sheet menu)
+                            (frame-top-level-sheet dialog)))
+              (sizes (loop for sheet in sheets
+                           collect (multiple-value-list
+                                    (bounding-rectangle-size sheet))))
+              (canvases (loop for sheet in sheets
+                              collect (mapcar #'canvas-size
+                                              (mirror-canvases sheet)))))
+         (true (resize-tab frame body "1400:900"))
+         (sleep 0.1)
+         (mapc #'handle-pending-events sheets)
+         (is equal '((1400 900)) (frame-resizes frame))
+         (is equal '() (frame-resizes dialog))
+         (is equal sizes
+             (loop for sheet in sheets
+                   collect (multiple-value-list
+                            (bounding-rectangle-size sheet))))
+         (is equal canvases
+             (loop for sheet in sheets
+                   collect (mapcar #'canvas-size
+                                   (mirror-canvases sheet)))))))))
 
 (define-test a-resize-presents-once
   (call-with-tab
@@ -255,37 +383,36 @@ context, and the number of scripts sent to the offscreen context."
    (lambda (frame port body)
      (declare (ignore port))
      (enable-frame frame)
-     (handle-pending-events frame)
+     (handle-pending-events (frame-top-level-sheet frame))
      (multiple-value-bind (blits drawn) (mirror-script-counts frame)
        (true (resize-tab frame body "1400:900"))
-       (handle-pending-events frame)
+       (handle-pending-events (frame-top-level-sheet frame))
        (multiple-value-bind (blits-after drawn-after) (mirror-script-counts frame)
          (true (> drawn-after drawn))
          (is = 1 (- blits-after blits)))))))
 
 (define-test the-browser-debounces-the-resize
-  (call-with-tab
-   'resize-test-frame
-   (lambda (frame port body)
-     (declare (ignore frame port))
-     (let ((relay (find "addEventListener('resize'"
-                        (%scripts (clog:window body))
-                        :test #'search)))
-       (true relay)
-       (when relay
-         (true (search "clearTimeout(" relay))
-         (true (search (format nil "},~D)"
-                               clim-clog:*resize-debounce-milliseconds*)
-                       relay))
-         (is = 150 clim-clog:*resize-debounce-milliseconds*))))))
+  (let ((clim-clog:*resize-debounce-milliseconds* 40))
+    (call-with-tab
+     'resize-test-frame
+     (lambda (frame port body)
+       (declare (ignore frame port))
+       (let ((relay (find "addEventListener('resize'"
+                          (%scripts (clog:window body))
+                          :test #'search)))
+         (true relay)
+         (when relay
+           (true (search "clearTimeout(" relay))
+           (true (search "setTimeout(" relay))
+           (true (search "},40)" relay))))))))
 
 (define-test an-unchanged-geometry-leaves-the-canvases-alone
   (call-with-tab
    'resize-test-frame
    (lambda (frame port body)
      (declare (ignore body))
-     (let ((top (frame-top-level-sheet frame))
-           (canvases (mirror-canvases frame)))
+     (let* ((top (frame-top-level-sheet frame))
+            (canvases (mirror-canvases top)))
        (flet ((set-geometry (width height)
                 (clim-backend:set-mirror-geometry
                  port top (make-bounding-rectangle 0 0 width height)))
@@ -311,3 +438,64 @@ context, and the number of scripts sent to the offscreen context."
                                                        "src/port.lisp")
                         :output-file fasl))))
     (is equal '() warnings)))
+
+(defun window-resize-hook (connection-id)
+  "The CLOG hook string of a handler bound on CONNECTION-ID's window, or NIL."
+  (let ((table (clog-connection:get-connection-data connection-id)))
+    (loop for key being the hash-keys of table using (hash-value value)
+          when (and (stringp key)
+                    (functionp value)
+                    (eql 0 (search "window:" key)))
+            return key)))
+
+(defun queued-event-types (port)
+  "The types of the events in PORT's clog-port queue, oldest first."
+  (clim-sys:with-lock-held ((clim-clog::clog-port-event-lock port))
+    (mapcar #'type-of (clim-clog::clog-port-event-queue port))))
+
+(define-test a-resize-is-queued-in-arrival-order
+  (let* ((socket (make-mock-socket))
+         (id (mock-socket-id socket))
+         (body (make-instance 'clog:clog-body
+                              :connection-id id
+                              :html-id "body"
+                              :window (make-instance 'clog:clog-window
+                                                     :connection-id id
+                                                     :html-id "window")))
+         (port nil))
+    (unwind-protect
+         (let (frame canvas-id hook)
+           (setf port (make-instance 'clim-clog:clog-port
+                                     :server-path (list :clog :body body
+                                                        :width 400
+                                                        :height 300))
+                 frame (make-application-frame
+                        'resize-test-frame
+                        :frame-manager (find-frame-manager :port port)
+                        :width 400 :height 300))
+           (enable-frame frame)
+           (stop-port-event-loop port)
+           (setf (clim-clog::clog-port-event-queue port) '()
+                 canvas-id (clog:html-id
+                            (clim-clog::clog-mirror-canvas
+                             (sheet-direct-mirror
+                              (frame-top-level-sheet frame))))
+                 hook (window-resize-hook id))
+           (true hook)
+           (when hook
+             (true (clim-clog::canvas-event-hook-p
+                    (clog-connection:get-connection-data id) hook))
+             (deliver-browser-message socket
+                                      (format nil "E:~a 1400:900" hook))
+             (is equal '(clim-clog:browser-window-resize-event)
+                 (queued-event-types port))
+             (deliver-browser-message
+              socket
+              (format nil "E:~a:mousedown ~
+10:20:10:20:1:false:false:false:false:10:20:10:20"
+                      canvas-id))
+             (is equal '(clim-clog:browser-window-resize-event
+                         pointer-button-press-event)
+                 (queued-event-types port))))
+      (when port (release-mock-port port))
+      (release-mock-socket socket))))

@@ -63,7 +63,8 @@
                (:file "mock-connection")
                (:file "coalesced-frames" :depends-on ("mock-connection"))
                (:file "input-order" :depends-on ("mock-connection"))
-               (:file "window-resize" :depends-on ("recording-context")))
+               (:file "window-resize"
+                :depends-on ("recording-context" "mock-connection")))
   :perform (test-op (o c)
                     (declare (ignore o c))
                     (let* ((suites '("CLIM-CLOG/TESTS/MEDIUM-METRICS"

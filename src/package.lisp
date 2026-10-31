@@ -37,5 +37,6 @@
            #:*clog-server-path*
            ;; Following a browser window resize (see resize.lisp).
            #:adjust-frame-to-browser-window
+           #:frame-follows-browser-window-p
            #:browser-window-resize-event
            #:*resize-debounce-milliseconds*))

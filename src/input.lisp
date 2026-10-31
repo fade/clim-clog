@@ -203,8 +203,8 @@ the rest McCLIM derives the character (if any) from the keysym name."
   "The browser events INSTALL-CLOG-INPUT-HANDLERS binds on a canvas.")
 
 (defparameter *canvas-event-hooks-key* "clim-clog-canvas-event-hooks"
-  "The key, in a connection's CLOG data, of the set of canvas event hooks
-clim-clog handles on the reader thread.  Keeping the set there ties its
+  "The key, in a connection's CLOG data, of the set of event hooks, for
+canvas input and window resizes, that clim-clog handles on the reader thread.  Keeping the set there ties its
 lifetime to the connection's.")
 
 (defvar *canvas-event-hooks-lock* (clim-sys:make-lock "clog canvas event hooks")
@@ -215,40 +215,50 @@ lifetime to the connection's.")
   (format nil "~a:~a" (clog:html-id canvas) event))
 
 (defun canvas-event-hook-p (table hook)
-  "True when HOOK names a canvas event bound by clim-clog on the connection
-whose CLOG data is TABLE."
+  "True when HOOK names an event that clim-clog handles on the reader thread
+of the connection whose CLOG data is TABLE."
   (clim-sys:with-lock-held (*canvas-event-hooks-lock*)
     (let ((hooks (gethash *canvas-event-hooks-key* table)))
       (and hooks (gethash hook hooks) t))))
 
-(defun register-canvas-event-hooks (canvas)
-  "Handle CANVAS's *CANVAS-EVENTS* on the websocket reader thread."
-  (let ((table (clog:connection-data canvas)))
+(defun register-reader-thread-hooks (obj events)
+  "Handle EVENTS, a list of CLOG event names bound on OBJ, on the websocket
+reader thread (see CANVAS-MESSAGE-HANDLER)."
+  (let ((table (clog:connection-data obj)))
     (when table
       (clim-sys:with-lock-held (*canvas-event-hooks-lock*)
         (let ((hooks (or (gethash *canvas-event-hooks-key* table)
                          (setf (gethash *canvas-event-hooks-key* table)
                                (make-hash-table :test 'equal)))))
-          (dolist (event *canvas-events*)
-            (setf (gethash (%canvas-hook canvas event) hooks) t))))))
+          (dolist (event events)
+            (setf (gethash (%canvas-hook obj event) hooks) t))))))
   (values))
 
-(defun forget-canvas-event-hooks (canvas)
-  "Stop handling CANVAS's events on the websocket reader thread."
-  (let ((table (ignore-errors (clog:connection-data canvas))))
+(defun register-canvas-event-hooks (canvas)
+  "Handle CANVAS's *CANVAS-EVENTS* on the websocket reader thread."
+  (register-reader-thread-hooks canvas *canvas-events*))
+
+(defun forget-reader-thread-hooks (obj events)
+  "Stop handling EVENTS bound on OBJ on the websocket reader thread."
+  (let ((table (ignore-errors (clog:connection-data obj))))
     (when table
       (clim-sys:with-lock-held (*canvas-event-hooks-lock*)
         (let ((hooks (gethash *canvas-event-hooks-key* table)))
           (when hooks
-            (dolist (event *canvas-events*)
-              (remhash (%canvas-hook canvas event) hooks)))))))
+            (dolist (event events)
+              (remhash (%canvas-hook obj event) hooks)))))))
   (values))
 
+(defun forget-canvas-event-hooks (canvas)
+  "Stop handling CANVAS's events on the websocket reader thread."
+  (forget-reader-thread-hooks canvas *canvas-events*))
+
 (defun canvas-message-handler (message connection-id)
-  "Run the handler of a canvas event that clim-clog bound, on the calling
-thread.  MESSAGE is CLOG's split websocket message, a list of its type and
-body.  Return true when the message was a canvas event and was handled,
-NIL to leave it to CLOG.  An error in the handler is logged, not signalled."
+  "Run the handler of an event that clim-clog registered for the reader
+thread, on the calling thread: a canvas input event or a window resize.
+MESSAGE is CLOG's split websocket message, a list of its type and body.
+Return true when the message was such an event and was handled, NIL to
+leave it to CLOG.  An error in the handler is logged, not signalled."
   (when (and connection-id
              (equal (first message) "E")
              (stringp (second message)))
