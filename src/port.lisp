@@ -265,16 +265,16 @@ the port's configured size when the sheet region is degenerate."
   (multiple-value-bind (x1 y1 x2 y2) (bounding-rectangle* region)
     (let ((mirror (sheet-direct-mirror sheet)))
       (when mirror
-        (let ((canvas (clog-mirror-canvas mirror))
-              (offscreen (clog-mirror-offscreen-canvas mirror))
-              (w (ceiling (- x2 x1)))
-              (h (ceiling (- y2 y1)))
-              (cur-w (ignore-errors
-                      (parse-integer (clog:property canvas "width")
-                                     :junk-allowed t)))
-              (cur-h (ignore-errors
-                      (parse-integer (clog:property canvas "height")
-                                     :junk-allowed t))))
+        (let* ((canvas (clog-mirror-canvas mirror))
+               (offscreen (clog-mirror-offscreen-canvas mirror))
+               (w (ceiling (- x2 x1)))
+               (h (ceiling (- y2 y1)))
+               (cur-w (ignore-errors
+                       (parse-integer (clog:property canvas "width")
+                                      :junk-allowed t)))
+               (cur-h (ignore-errors
+                       (parse-integer (clog:property canvas "height")
+                                      :junk-allowed t))))
           ;; The intrinsic <canvas> width/height attributes set the drawing
           ;; surface size (not just the CSS box).  Writing EITHER attribute
           ;; -- even to its current value -- resets the canvas bitmap to

@@ -55,13 +55,17 @@ place of a browser connection."))
 (defclass stand-in-document (stand-in-element clog:clog-document) ())
 
 (defclass stand-in-canvas (stand-in-element clog:clog-canvas)
-  ((properties :initform (make-hash-table :test 'equal) :reader %properties))
-  (:documentation "A canvas that keeps the properties set on it."))
+  ((properties :initform (make-hash-table :test 'equal) :reader %properties)
+   (writes :initform 0 :accessor %writes
+           :documentation "How many times a property was set on the canvas."))
+  (:documentation "A canvas that keeps the properties set on it and counts
+the writes."))
 
 (defmethod clog:property ((obj stand-in-canvas) name &key default-answer)
   (gethash name (%properties obj) default-answer))
 
 (defmethod (setf clog:property) (value (obj stand-in-canvas) name)
+  (incf (%writes obj))
   (setf (gethash name (%properties obj)) (princ-to-string value)))
 
 (defmethod clog:create-context2d ((obj stand-in-canvas))
@@ -231,3 +235,36 @@ Return true when FRAME was told."
                                clim-clog:*resize-debounce-milliseconds*)
                        relay))
          (is = 150 clim-clog:*resize-debounce-milliseconds*))))))
+
+(define-test an-unchanged-geometry-leaves-the-canvases-alone
+  (call-with-tab
+   'resize-test-frame
+   (lambda (frame port body)
+     (declare (ignore body))
+     (let ((top (frame-top-level-sheet frame))
+           (canvases (mirror-canvases frame)))
+       (flet ((set-geometry (width height)
+                (clim-backend:set-mirror-geometry
+                 port top (make-bounding-rectangle 0 0 width height)))
+              (writes ()
+                (mapcar #'%writes canvases)))
+         (set-geometry 1400 900)
+         (let ((after-resize (writes)))
+           (set-geometry 1400 900)
+           (is equal after-resize (writes)))
+         (dolist (canvas canvases)
+           (is equal '("1400" "900") (canvas-size canvas))))))))
+
+(define-test the-port-source-compiles-without-full-warnings
+  (let ((warnings '()))
+    (uiop:with-temporary-file (:pathname fasl :type "fasl")
+      (handler-bind ((warning
+                       (lambda (w)
+                         (unless (typep w 'style-warning)
+                           (push (princ-to-string w) warnings))
+                         (muffle-warning w))))
+        (with-compilation-unit (:override t)
+          (compile-file (asdf:system-relative-pathname "clim-clog"
+                                                       "src/port.lisp")
+                        :output-file fasl))))
+    (is equal '() warnings)))
