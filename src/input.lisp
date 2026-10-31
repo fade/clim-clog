@@ -267,10 +267,12 @@ reader thread (see CANVAS-MESSAGE-HANDLER)."
 ;;;   - HANDLE-MESSAGE wraps the calls in a HANDLER-CASE for every condition,
 ;;;     so an error a handler does not handle is logged by CLOG and does not
 ;;;     reach the debugger.
-;;; CANVAS-MESSAGE-HANDLER is the only handler clim-clog adds.  No error from
-;;; it reaches that HANDLER-CASE: it logs the error, or invokes the debugger
-;;; itself when CLOG-CONNECTION:*BREAK-ON-ERROR* is true (see
-;;; %CALL-READER-THREAD-HANDLER).
+;;; CANVAS-MESSAGE-HANDLER is the only handler clim-clog adds.  An error in
+;;; the event's own handler does not reach that HANDLER-CASE: it is logged,
+;;; or the debugger is invoked first when CLOG-CONNECTION:*BREAK-ON-ERROR* is
+;;; true (see %CALL-READER-THREAD-HANDLER).  The HANDLER-CASE stays active
+;;; during that debugger session, so a condition the debugger leaves
+;;; unhandled still reaches it.
 (defun clog-message-handlers-symbol ()
   "Return CLOG-CONNECTION::*MESSAGE-HANDLERS*, the symbol whose value is the
 list of CLOG's websocket message handlers.  Signal an error when the loaded
@@ -311,8 +313,14 @@ An error in the handler:
   - enters the debugger, with an ABORT restart that drops the event, when
     it is true.
 The debugger runs on the websocket reader thread, so the connection reads no
-further message, query answers included, until a restart is chosen.  The
-connection's \"clog-debug\" hook is never called, whatever
+further message, query answers included, until a restart is chosen.  Choose
+the \"Drop this clim-clog event\" restart (restart 0, or a in SLY): a quit
+command (q in SLY) invokes the outermost restart on this thread, which ends
+the reader thread and closes that browser connection.  CLOG's catch-all
+HANDLER-CASE in CLOG-CONNECTION::HANDLE-MESSAGE stays active during the
+debugger session, so a condition the debugger does not handle itself, such
+as an error from evaluating in a frame, unwinds the session to CLOG, which
+logs it and drops the event.  The connection's \"clog-debug\" hook is never called, whatever
 CLOG-CONNECTION:*DISABLE-CLOG-DEBUGGING* holds: a browser-based debugger's
 answer arrives on the reader thread it would block."
   (when (and connection-id
