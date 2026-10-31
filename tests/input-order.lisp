@@ -99,7 +99,8 @@ with the summary of the event it must queue."
              (loop for (message) in (interleaved-messages canvas-id)
                    do (deliver-browser-message socket message)
                    collect (length (queued-events port)))))
-       (is equal (loop for n from 1 to *message-count* collect n) lengths)))))
+       (is equal (loop for n from 1 to *message-count* collect n) lengths)
+       (is equal '() (reader-thread-queries socket))))))
 
 (define-test canvas-events-keep-arrival-order
   (call-with-canvas
@@ -108,7 +109,8 @@ with the summary of the event it must queue."
        (dolist (message messages)
          (deliver-browser-message socket (car message)))
        (is equal (mapcar #'cdr messages)
-           (mapcar #'event-summary (queued-events port)))))))
+           (mapcar #'event-summary (queued-events port)))
+       (is equal '() (reader-thread-queries socket))))))
 
 (define-test other-clog-events-keep-their-own-path
   (call-with-canvas

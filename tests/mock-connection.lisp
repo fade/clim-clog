@@ -27,7 +27,8 @@
            #:release-mock-port
            #:stop-port-event-loop
            #:deliver-browser-message
-           #:mock-socket-reader))
+           #:mock-socket-reader
+           #:reader-thread-queries))
 
 (in-package #:clim-clog/tests/mock-connection)
 
@@ -51,6 +52,9 @@ MESSAGE is handled, or NIL.")
                 :reader %inbox-count)
    (reader :initform nil :accessor mock-socket-reader
            :documentation "The thread that hands the inbox to CLOG.")
+   (reader-queries :initform '() :accessor %reader-queries
+                   :documentation "The queries sent from the reader
+thread, newest first.")
    (lock :initform (clim-sys:make-lock "mock socket") :reader %lock))
   (:documentation "A websocket stand-in that records the scripts CLOG sends,
 answers CLOG queries without a browser, and hands incoming messages to CLOG
@@ -74,26 +78,32 @@ not a query.  CLOG wraps a query as ws.send (\"ID:\"+eval(\"...\"))."
 
 (defun %reader-loop (socket)
   "Hand each message in SOCKET's inbox to CLOG-CONNECTION::HANDLE-MESSAGE,
-oldest first, until the message :STOP."
-  (loop
-    (bt:wait-on-semaphore (%inbox-count socket))
-    (destructuring-bind (message . done)
-        (clim-sys:with-lock-held ((%lock socket))
-          (pop (%inbox socket)))
-      (when (eq message :stop)
-        (return))
-      (unwind-protect (clog-connection::handle-message socket message)
-        (when done
-          (bt:signal-semaphore done))))))
+oldest first, until the message :STOP.  Bind
+CLOG-CONNECTION:*BREAK-ON-ERROR* to NIL, so an error in a handler is logged
+rather than entering the debugger on this thread."
+  (let ((clog-connection:*break-on-error* nil))
+    (loop
+      (bt:wait-on-semaphore (%inbox-count socket))
+      (destructuring-bind (message . done)
+          (clim-sys:with-lock-held ((%lock socket))
+            (pop (%inbox socket)))
+        (when (eq message :stop)
+          (return))
+        (unwind-protect (clog-connection::handle-message socket message)
+          (when done
+            (bt:signal-semaphore done)))))))
 
 (defmethod websocket-driver:send ((ws mock-socket) data
                                   &key start end type code callback)
   "Record DATA.  When it is a CLOG query, post the answer to the socket's
-reader thread as the message \"ID:answer\"."
+reader thread as the message \"ID:answer\", and record DATA as a reader
+thread query when sent from that thread."
   (declare (ignore start end type code callback))
-  (clim-sys:with-lock-held ((%lock ws))
-    (push data (%scripts ws)))
   (let ((query-id (%query-id data)))
+    (clim-sys:with-lock-held ((%lock ws))
+      (push data (%scripts ws))
+      (when (and query-id (eq (bt:current-thread) (mock-socket-reader ws)))
+        (push data (%reader-queries ws))))
     (when query-id
       (%post ws (format nil "~d:~a" query-id *query-answer*))))
   nil)
@@ -115,10 +125,18 @@ reader thread, and return it."
 
 (defun release-mock-socket (socket)
   "Stop SOCKET's reader thread once it has handled every message already
-posted, and remove SOCKET's entries from CLOG's connection tables."
+posted, and remove SOCKET's entries from CLOG's connection tables.  Signal
+an error when the thread is still running after *DELIVERY-TIMEOUT* seconds."
   (let ((reader (mock-socket-reader socket)))
     (when reader
       (%post socket :stop)
+      (let ((deadline (+ (get-internal-real-time)
+                         (* *delivery-timeout* internal-time-units-per-second))))
+        (loop while (bt:thread-alive-p reader)
+              do (when (> (get-internal-real-time) deadline)
+                   (error "The mock reader thread of ~a did not stop within ~d s."
+                          (mock-socket-id socket) *delivery-timeout*))
+                 (sleep 0.01)))
       (bt:join-thread reader)
       (setf (mock-socket-reader socket) nil)))
   (let ((id (mock-socket-id socket)))
@@ -131,6 +149,12 @@ posted, and remove SOCKET's entries from CLOG's connection tables."
   "The scripts sent to SOCKET, oldest first."
   (clim-sys:with-lock-held ((%lock socket))
     (reverse (%scripts socket))))
+
+(defun reader-thread-queries (socket)
+  "The queries sent to SOCKET from its reader thread, oldest first.  Each
+one waits out the query timeout, as it does in a browser."
+  (clim-sys:with-lock-held ((%lock socket))
+    (reverse (%reader-queries socket))))
 
 (defun clear-sent-scripts (socket)
   "Forget the scripts sent to SOCKET so far."

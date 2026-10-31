@@ -73,6 +73,7 @@ with the data \"x\"."
        (deliver-browser-message socket (format nil "E:~a:query x"
                                                 (clog:html-id probe)))
        (is eq (mock-socket-reader socket) thread)
+       (is = 1 (length (reader-thread-queries socket)))
        (false answer)
        (true (>= elapsed (* 0.9 *probe-query-time-out*)))
        (let ((clog-connection::*query-time-out* *probe-query-time-out*)
