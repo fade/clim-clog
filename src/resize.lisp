@@ -40,9 +40,13 @@ handler."
   ()
   (:documentation "The browser window holding a port changed to the size of
 the event's native region, (0 0 width height) in CSS pixels.  One is queued
-for the port's graft; the port I/O thread then dispatches one to the top-level
-sheet of each frame on the port, and HANDLE-EVENT on that sheet calls
-ADJUST-FRAME-TO-BROWSER-WINDOW on the frame's thread."))
+for the port's graft.  The port I/O thread then dispatches one to the top-level
+sheet of each frame of the port's frame managers when:
+  - the frame's top-level sheet exists;
+  - that sheet has a mirror;
+  - FRAME-FOLLOWS-BROWSER-WINDOW-P is true of the frame.
+HANDLE-EVENT on that sheet calls ADJUST-FRAME-TO-BROWSER-WINDOW on the
+frame's thread."))
 
 (defmethod event-type ((event browser-window-resize-event))
   :browser-window-resize)
