@@ -34,4 +34,9 @@
            #:call-with-coalesced-flushes
            ;; Harness entry points (see examples/hello.lisp).
            #:make-clog-medium-for-context
-           #:*clog-server-path*))
+           #:*clog-server-path*
+           ;; Following a browser window resize (see resize.lisp).
+           #:adjust-frame-to-browser-window
+           #:frame-follows-browser-window-p
+           #:browser-window-resize-event
+           #:*resize-debounce-milliseconds*))

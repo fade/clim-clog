@@ -86,6 +86,8 @@
   ;; Every port needs at least one frame manager registered.
   (push (make-instance 'clog-frame-manager :port port)
         (slot-value port 'climi::frame-managers))
+  ;; Follow browser window resizes (see resize.lisp).
+  (install-browser-resize-handler port)
   ;; Start the port I/O loop (a thread looping PROCESS-NEXT-EVENT), the
   ;; single consumer of our event queue.  CLX does this here too.
   (restart-port port))
@@ -263,23 +265,24 @@ the port's configured size when the sheet region is degenerate."
   (multiple-value-bind (x1 y1 x2 y2) (bounding-rectangle* region)
     (let ((mirror (sheet-direct-mirror sheet)))
       (when mirror
-        (let ((canvas (clog-mirror-canvas mirror))
-              (offscreen (clog-mirror-offscreen-canvas mirror))
-              (w (ceiling (- x2 x1)))
-              (h (ceiling (- y2 y1)))
-              (cur-w (ignore-errors
-                      (parse-integer (clog:property canvas "width")
-                                     :junk-allowed t)))
-              (cur-h (ignore-errors
-                      (parse-integer (clog:property canvas "height")
-                                     :junk-allowed t))))
+        (let* ((canvas (clog-mirror-canvas mirror))
+               (offscreen (clog-mirror-offscreen-canvas mirror))
+               (w (ceiling (- x2 x1)))
+               (h (ceiling (- y2 y1)))
+               (cur-w (ignore-errors
+                       (parse-integer (clog:property canvas "width")
+                                      :junk-allowed t)))
+               (cur-h (ignore-errors
+                       (parse-integer (clog:property canvas "height")
+                                      :junk-allowed t))))
           ;; The intrinsic <canvas> width/height attributes set the drawing
           ;; surface size (not just the CSS box).  Writing EITHER attribute
           ;; -- even to its current value -- resets the canvas bitmap to
           ;; transparent, which on a visible canvas reads as a page flash.
           ;; So only touch the bitmap when the size actually changes, and
-          ;; after a real resize immediately re-blit the offscreen so the
-          ;; viewer never sees the blanked frame between resize and repaint.
+          ;; after a real resize request a re-blit of the offscreen: at once
+          ;; outside a coalescing scope, otherwise once when the scope ends,
+          ;; after the repaint the resize causes.
           (unless (and (eql w cur-w) (eql h cur-h))
             (ignore-errors
              (setf (clog:property canvas "width")  (princ-to-string w)
@@ -290,7 +293,7 @@ the port's configured size when the sheet region is degenerate."
              ;; so re-apply the blit composite mode on the visible context.
              (setf (clog:global-composite-operation (clog-mirror-context mirror))
                    "copy")
-             (clog-mirror-flush mirror))))))
+             (request-mirror-flush mirror))))))
     (values x1 y1 x2 y2)))
 
 ;;; The double-buffer page-flip hook.  CLIM's display functions only *record*

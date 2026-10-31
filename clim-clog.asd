@@ -26,6 +26,7 @@
    (:file "medium"        :depends-on ("package" "port"))
    (:file "input"         :depends-on ("package" "port"))
    (:file "coalesced-flush" :depends-on ("package" "port"))
+   (:file "resize"        :depends-on ("package" "port" "graft" "input"))
    (:file "frame-manager" :depends-on ("package" "port" "medium"))))
 
 (defsystem "clim-clog/examples"
@@ -44,7 +45,9 @@
 ;;;   - the canvas calls that drawing an elliptical arc makes, read back from
 ;;;     that context by a replay of its recorded scripts;
 ;;;   - how many frames one event presents, and the order browser input is
-;;;     queued in, on a frame whose CLOG connection is a recording stand-in.
+;;;     queued in, on a frame whose CLOG connection is a recording stand-in;
+;;;   - a frame, its canvases, and the port following a browser window
+;;;     resize, over a stand-in body and window.
 ;;; The test-op runs every listed suite package in a single Parachute run.
 
 (defsystem "clim-clog/tests"
@@ -59,7 +62,9 @@
                (:file "ellipse-arcs" :depends-on ("recording-context"))
                (:file "mock-connection")
                (:file "coalesced-frames" :depends-on ("mock-connection"))
-               (:file "input-order" :depends-on ("mock-connection")))
+               (:file "input-order" :depends-on ("mock-connection"))
+               (:file "window-resize"
+                :depends-on ("recording-context" "mock-connection")))
   :perform (test-op (o c)
                     (declare (ignore o c))
                     (let* ((suites '("CLIM-CLOG/TESTS/MEDIUM-METRICS"
@@ -68,7 +73,8 @@
                                      "CLIM-CLOG/TESTS/MEASURED-TEXT"
                                      "CLIM-CLOG/TESTS/ELLIPSE-ARCS"
                                      "CLIM-CLOG/TESTS/COALESCED-FRAMES"
-                                     "CLIM-CLOG/TESTS/INPUT-ORDER"))
+                                     "CLIM-CLOG/TESTS/INPUT-ORDER"
+                                     "CLIM-CLOG/TESTS/WINDOW-RESIZE"))
                            (packages
                              (mapcar
                               (lambda (name)
