@@ -713,15 +713,18 @@ whole substring would block on a round-trip per keystroke."
 ;;; The medium draws into the mirror's offscreen canvas; here we blit it to
 ;;; the visible canvas in a single DRAW-IMAGE.  This is what eliminates the
 ;;; redisplay flash: a full redisplay clears and repaints the offscreen
-;;; buffer (invisible), and only the finished frame appears on screen.  The
-;;; bare-medium Phase-0 harness has no mirror and draws straight to the
+;;; buffer (invisible), and only the finished frame appears on screen.
+;;; Inside a coalescing scope (see port.lisp) the blit waits for the scope's
+;;; end, so a redisplay that finishes output once per line still presents
+;;; once.  The bare-medium harness has no mirror and draws straight to the
 ;;; visible canvas, so flushing is a no-op there.
 ;;; ------------------------------------------------------------------
 
 (defun %medium-flush (medium)
+  "Ask for MEDIUM's mirror to be presented; see REQUEST-MIRROR-FLUSH."
   (let ((mirror (medium-clog-mirror medium)))
     (when mirror
-      (clog-mirror-flush mirror))))
+      (request-mirror-flush mirror))))
 
 (defmethod medium-finish-output ((medium clog-medium)) (%medium-flush medium))
 (defmethod medium-force-output ((medium clog-medium)) (%medium-flush medium))

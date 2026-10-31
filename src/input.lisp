@@ -1,12 +1,13 @@
 ;;;; input.lisp
 ;;;;
-;;;; Phase 2: input.  CLOG delivers browser pointer/keyboard events to
-;;;; handlers that run in CLOG's own worker threads.  Those handlers
-;;;; translate the event into a CLIM event object and push it onto the
-;;;; port's event queue.  The port I/O loop (started by RESTART-PORT in
-;;;; port.lisp) is the single consumer: PROCESS-NEXT-EVENT pops one event
-;;;; and DISTRIBUTE-EVENTs it into the CLIM sheet hierarchy, which drives
-;;;; the command loop, presentation highlighting, accept, and so on.
+;;;; Input.  CLOG delivers browser pointer/keyboard events to handlers that
+;;;; run on its websocket reader thread, in arrival order (see
+;;;; CANVAS-MESSAGE-HANDLER).  Those handlers translate the event into a CLIM
+;;;; event object and push it onto the port's event queue.  The port I/O loop
+;;;; (started by RESTART-PORT in port.lisp) is the single consumer:
+;;;; PROCESS-NEXT-EVENT pops one event and DISTRIBUTE-EVENTs it into the CLIM
+;;;; sheet hierarchy, which drives the command loop, presentation
+;;;; highlighting, accept, and so on.
 ;;;;
 ;;;; Coordinate note: CLOG reports pointer x/y relative to the target
 ;;;; element (the canvas), which is exactly the native (mirror) coordinate
@@ -186,12 +187,91 @@ the rest McCLIM derives the character (if any) from the keysym name."
       (apply #'make-instance class args))))
 
 ;;; ------------------------------------------------------------------
-;;; Handler installation
+;;; Handler installation and arrival order
+;;;
+;;; CLOG runs each browser event's handler on a thread of its own, so two
+;;; events can reach the queue in either order.  The canvas's own events are
+;;; handled instead by CANVAS-MESSAGE-HANDLER, which CLOG calls for each
+;;; websocket message, in arrival order, on the thread that reads the
+;;; websocket, before it would start such a thread.  Those handlers only
+;;; build a CLIM event and enqueue it: they never draw, query the browser,
+;;; or wait, any of which would stall the reader that delivers the answer.
 ;;; ------------------------------------------------------------------
+
+(defparameter *canvas-events*
+  '("mousedown" "mouseup" "mousemove" "wheel" "keydown" "keyup")
+  "The browser events INSTALL-CLOG-INPUT-HANDLERS binds on a canvas.")
+
+(defparameter *canvas-event-hooks-key* "clim-clog-canvas-event-hooks"
+  "The key, in a connection's CLOG data, of the set of canvas event hooks
+clim-clog handles on the reader thread.  Keeping the set there ties its
+lifetime to the connection's.")
+
+(defvar *canvas-event-hooks-lock* (clim-sys:make-lock "clog canvas event hooks")
+  "Guards the canvas hook sets kept in CLOG connection data.")
+
+(defun %canvas-hook (canvas event)
+  "CLOG's hook string for EVENT on CANVAS, the key of its handler."
+  (format nil "~a:~a" (clog:html-id canvas) event))
+
+(defun canvas-event-hook-p (table hook)
+  "True when HOOK names a canvas event bound by clim-clog on the connection
+whose CLOG data is TABLE."
+  (clim-sys:with-lock-held (*canvas-event-hooks-lock*)
+    (let ((hooks (gethash *canvas-event-hooks-key* table)))
+      (and hooks (gethash hook hooks) t))))
+
+(defun register-canvas-event-hooks (canvas)
+  "Handle CANVAS's *CANVAS-EVENTS* on the websocket reader thread."
+  (let ((table (clog:connection-data canvas)))
+    (when table
+      (clim-sys:with-lock-held (*canvas-event-hooks-lock*)
+        (let ((hooks (or (gethash *canvas-event-hooks-key* table)
+                         (setf (gethash *canvas-event-hooks-key* table)
+                               (make-hash-table :test 'equal)))))
+          (dolist (event *canvas-events*)
+            (setf (gethash (%canvas-hook canvas event) hooks) t))))))
+  (values))
+
+(defun forget-canvas-event-hooks (canvas)
+  "Stop handling CANVAS's events on the websocket reader thread."
+  (let ((table (ignore-errors (clog:connection-data canvas))))
+    (when table
+      (clim-sys:with-lock-held (*canvas-event-hooks-lock*)
+        (let ((hooks (gethash *canvas-event-hooks-key* table)))
+          (when hooks
+            (dolist (event *canvas-events*)
+              (remhash (%canvas-hook canvas event) hooks)))))))
+  (values))
+
+(defun canvas-message-handler (message connection-id)
+  "Run the handler of a canvas event that clim-clog bound, on the calling
+thread.  MESSAGE is CLOG's split websocket message, a list of its type and
+body.  Return true when the message was a canvas event and was handled,
+NIL to leave it to CLOG.  An error in the handler is logged, not signalled."
+  (when (and connection-id
+             (equal (first message) "E")
+             (stringp (second message)))
+    (let* ((body (second message))
+           (space (position #\Space body))
+           (hook (subseq body 0 space))
+           (data (and space (subseq body (1+ space))))
+           (table (clog-connection:get-connection-data connection-id)))
+      (when (and table (canvas-event-hook-p table hook))
+        (let ((handler (gethash hook table)))
+          (when handler
+            (handler-case (funcall handler data)
+              (error (e)
+                (format *error-output* "~&[clim-clog input] ~a~%" e)))
+            t))))))
+
+(pushnew 'canvas-message-handler clog-connection::*message-handlers*)
 
 (defun install-clog-input-handlers (port sheet canvas)
   "Attach CLOG pointer, wheel, and keyboard handlers on CANVAS that enqueue
 CLIM events for SHEET (the top-level mirrored sheet) onto PORT's queue.
+The handlers run on CLOG's websocket reader thread, in arrival order (see
+CANVAS-MESSAGE-HANDLER).
 
 A <canvas> is not focusable by default, so it receives no keyboard events.
 We give it tab-index 0 and focus it; the browser then routes keydown/keyup
@@ -247,6 +327,7 @@ to it (and re-focuses it on click)."
     (setf (clog:tab-index canvas) 0)
     (clog:set-on-key-down canvas (key-handler 'key-press-event) :disable-default t)
     (clog:set-on-key-up   canvas (key-handler 'key-release-event))
+    (register-canvas-event-hooks canvas)
     (clog:focus canvas))
   (values))
 
